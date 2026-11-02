@@ -4,7 +4,15 @@ Local MCP message bridge for **Claude Code** and **Kimi CLI**.
 
 Agent Bridge lets two coding agents exchange tasks, results and bounded autonomous conversations through one shared SQLite database. It uses MCP stdio transport and local files only — no TCP/UDP server, no external service and no network protocol of its own.
 
+The reference Claude Code setup runs the Claude-side worker against **Strata**, model `qwen3.8-flash-next-unsloth-ud-q4_k_xl`, through the local launcher. The bridge core itself is model-agnostic and can dispatch work to any compatible agent client.
+
 > **Status: experimental.** The main exchange flow is implemented and covered by tests, but the project is still evolving. See [TODO.md](TODO.md) for known gaps.
+
+## Stack
+
+- **Claude Code worker:** local headless Claude Code launcher, configured for **Strata**, model `qwen3.8-flash-next-unsloth-ud-q4_k_xl`.
+- **Kimi CLI worker:** official Kimi CLI in prompt mode.
+- **Agent Bridge core:** Python 3.11+, MCP stdio transport and SQLite.
 
 ## Highlights
 
