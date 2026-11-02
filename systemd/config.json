@@ -1,0 +1,7 @@
+{
+  "_comment": "Which recipients the per-agent listener may dispatch automatically (listener.py re-reads this on every scan; false = the listener idles). kimi is off by default: Kimi CLI -p applies its 'auto' permission policy without approval prompts (see kimi_headless.sh / README).",
+  "auto": {
+    "claude": true,
+    "kimi": false
+  }
+}

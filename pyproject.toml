@@ -1,0 +1,9 @@
+[project]
+name = "agent-bridge"
+version = "0.1.0"
+description = "Local MCP message bridge between Claude Code and Kimi CLI over a shared SQLite database"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Art3mk4" }]
+requires-python = ">=3.11"
+dependencies = ["mcp>=2.0,<3"]

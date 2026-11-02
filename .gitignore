@@ -1,0 +1,27 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local bridge state
+bridge.db
+bridge.db-wal
+bridge.db-shm
+errors.log
+outbox/
+runtime/
+systemd/runtime/
+
+# Local agent/client configuration
+.mcp.json
+.claude/
+.kimi-code/
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
