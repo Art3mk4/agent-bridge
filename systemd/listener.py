@@ -50,8 +50,10 @@ CLI (emergency control without an MCP session):
     listener.py status --agent ... [--config --runtime-dir]
     listener.py enable --agent ... [--db --config --runtime-dir --on-message]
     listener.py disable --agent ... [--config --runtime-dir]
-    listener.py progress --agent ... [--config --runtime-dir]   # human one-liner
-    listener.py watch    --agent ... [--once]                   # 1 s refresh
+    listener.py progress --agent ... [--db --config --runtime-dir]
+                                                                # human one-liner,
+                                                                # exit 0 always
+    listener.py watch    --agent ... [--db --once]              # 1 s refresh
 """
 
 from __future__ import annotations
@@ -134,11 +136,22 @@ def _write_private(path: Path, text: str) -> None:
 
 def _log(runtime_dir: Path, msg: str) -> None:
     # Metadata only: ids, states, pids, exit codes. Never payload.
+    # os.open with 0o600 (same pattern as _write_private): plain open("a")
+    # creates the file by umask (0644). The mode applies only at creation,
+    # so an existing log is chmod'ed too — a pre-fix 0644 file gets pressed
+    # down to 0600 on the next write.
+    path = Path(runtime_dir) / "dispatcher.log"
     try:
-        with open(Path(runtime_dir) / "dispatcher.log", "a",
-                  encoding="utf-8") as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} INFO listener: "
-                    f"{msg}\n")
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, (f"{time.strftime('%Y-%m-%d %H:%M:%S')} INFO "
+                          f"listener: {msg}\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+    except OSError:
+        return
+    try:
+        path.chmod(0o600)
     except OSError:
         pass
 
@@ -148,6 +161,9 @@ def _rotate_log(rt: Path) -> None:
         p = rt / "dispatcher.log"
         if p.stat().st_size > LOG_MAX_BYTES:
             os.replace(p, rt / "dispatcher.log.1")
+            # os.replace keeps the old mode; the rotated copy must not stay
+            # world-readable while the fresh log is recreated by _log.
+            (rt / "dispatcher.log.1").chmod(0o600)
     except OSError:
         pass
 
@@ -370,6 +386,39 @@ def _attempt_result(db: str | Path, mid: int) -> str | None:
         return row[0] if row else None
     except sqlite3.Error:
         return None
+    finally:
+        con.close()
+
+
+def _senders_for(db: str | Path, ids: list[int]) -> dict[int, str]:
+    """Senders of the message ids a progress line mentions (ids and names
+    only — never payload).
+
+    Strictly read-only on purpose: this runs from a statusline every couple of
+    seconds next to live dispatches, and may never write. The existence check
+    before connect is not cosmetic — sqlite creates a file on connect, so a
+    mistyped --db must not leave an empty stray database behind. Any failure
+    degrades to an empty map: the line is still useful without senders.
+    """
+    if not ids:
+        return {}
+    p = Path(db)
+    if not p.exists():
+        return {}
+    try:
+        con = sqlite3.connect(p.absolute().as_uri() + "?mode=ro", uri=True,
+                              timeout=1.0)
+    except (OSError, ValueError, sqlite3.Error):
+        return {}
+    try:
+        con.execute("PRAGMA busy_timeout=1000")
+        marks = ",".join("?" * len(ids))
+        rows = con.execute(
+            f"SELECT id, sender FROM messages WHERE id IN ({marks})",
+            ids).fetchall()
+        return {int(r[0]): str(r[1]) for r in rows}
+    except sqlite3.Error:
+        return {}
     finally:
         con.close()
 
@@ -689,24 +738,37 @@ def _fmt_age(ts: float | None) -> str:
     return f"{d / 3600:.1f}h"
 
 
-def progress_line(agent: str, config: str, runtime_dir: str | Path) -> str:
+def progress_line(agent: str, config: str, runtime_dir: str | Path,
+                  db: str | Path | None = None) -> str:
     """One human-readable line: what the listener is doing right now, and what
-    the last dispatch turned out to be. Same facts as status(), no payload."""
+    the last dispatch turned out to be. Same facts as status(), plus the
+    sender of every message id mentioned (db given → `sender=` after the msg#).
+    Names and ids only, never payload, prompt or tokens."""
     st = status(agent, config, runtime_dir)
+    cur = st["progress"] if isinstance(st["progress"], dict) else None
+    last = st["last"] if isinstance(st["last"], dict) else None
+    ids = [m for m in ((cur or {}).get("message"), st["message"],
+                       (last or {}).get("message")) if isinstance(m, int)]
+    senders = _senders_for(db, sorted(set(ids))) if db is not None else {}
+
+    def _seg(mid: Any) -> str:
+        seg = f"msg#{mid}"
+        if isinstance(mid, int) and senders.get(mid):
+            seg += f" sender={senders[mid]}"
+        return seg
+
     parts = [f"[{st['agent']}]", st["stage"]]
-    cur = st["progress"]
     if cur:
-        parts.append(f"msg#{cur.get('message')}")
+        parts.append(_seg(cur.get("message")))
         if cur.get("supervisor_pid"):
             parts.append(f"supervisor={cur['supervisor_pid']}")
         parts.append(f"for {_fmt_age(cur.get('since'))}")
     elif st["message"] is not None:
         # A listener without progress.json still tells us the id it is waiting
         # on through its state file; that stays worth showing.
-        parts.append(f"msg#{st['message']}")
-    last = st["last"]
-    if isinstance(last, dict):
-        bits = [f"msg#{last.get('message')}",
+        parts.append(_seg(st["message"]))
+    if last is not None:
+        bits = [_seg(last.get("message")),
                 f"result={last.get('result') or '?'}"]
         if isinstance(last.get("duration_s"), (int, float)):
             bits.append(f"in {last['duration_s']:.1f}s")
@@ -797,8 +859,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--runtime-dir", default=str(DEFAULT_RUNTIME))
     p.add_argument("--on-message", default=str(DEFAULT_ON_MESSAGE))
     p.add_argument("--once", action="store_true",
-                   help="with watch: print one snapshot and exit (this is what"
-                        " a statusline should call, on its own timer)")
+                   help="with watch: print one snapshot and exit (progress"
+                        " already prints exactly one, so a statusline can"
+                        " call either; it is accepted here for symmetry)")
     return p.parse_args(argv)
 
 
@@ -811,11 +874,23 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(status(a.agent, a.config, rt), ensure_ascii=False),
               flush=True)
     elif a.action == "progress":
-        print(progress_line(a.agent, a.config, rt), flush=True)
+        # Exactly one snapshot, always exit 0: a statusline calls this on a
+        # timer and must never see a traceback or a nonzero status. Garbage
+        # config, unreadable runtime dir, foreign db — an honest unknown is
+        # still a line.
+        try:
+            line = progress_line(a.agent, a.config, rt, a.db)
+        except Exception:
+            line = f"[{a.agent}] unknown"
+        print(line, flush=True)
     elif a.action == "watch":
         try:
             while True:
-                print(progress_line(a.agent, a.config, rt), flush=True)
+                try:
+                    line = progress_line(a.agent, a.config, rt, a.db)
+                except Exception:
+                    line = f"[{a.agent}] unknown"
+                print(line, flush=True)
                 if a.once:
                     break
                 time.sleep(PROGRESS_REFRESH_SECONDS)

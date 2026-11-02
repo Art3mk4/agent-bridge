@@ -40,7 +40,7 @@ Kimi CLI session ───── MCP stdio ──► server.py (AGENT_ID=kimi) �
                          one-shot Claude or Kimi worker
 ```
 
-Each MCP server process derives its sender identity from `AGENT_ID`; tool arguments cannot impersonate another sender. Both sides point at the same `bridge.db`, but use opposite values of `AGENT_ID`.
+Each MCP server process derives its sender identity from `AGENT_ID`; tool arguments cannot impersonate another sender. Both sides point at the same `bridge.db`, but use opposite values of `AGENT_ID`. Agent ids are fixed (`claude` and `kimi`, `AGENTS` in `server.py`); the name `cclocal` elsewhere in this README is only the local launcher/integration name and the report prefix for the `claude` side — `AGENT_ID=cclocal` is rejected.
 
 Interactive MCP sessions do not receive push notifications: an active agent checks `receive_messages` when it is already running. The optional listener adds the headless path: it scans the database, runs `on_message.py` for one dispatchable message and waits until that supervisor exits before scanning again.
 
@@ -149,7 +149,7 @@ Start a new Kimi session from the project and trust the workspace if the MCP com
 | `mark_read` | Acknowledge completed messages; only the recipient can acknowledge. |
 | `start_conversation` | Create a bounded dialogue and send its root `task`. |
 | `conversation` | Inspect, complete, cancel or escalate a dialogue. |
-| `listener` | Enable, disable or inspect the current agent's background listener. |
+| `listener` | Enable, disable or inspect the current agent's background listener; `action="progress"` returns the same one-line progress string as the cclocal status line. |
 
 ## Basic exchange
 
@@ -209,30 +209,58 @@ uv run python systemd/listener.py enable   --agent claude
 - `progress`: the currently trusted lifecycle record;
 - `last`: the previous dispatch outcome, including duration and exit code where available.
 
+From an MCP session the same human-readable snapshot is one call: `listener(action="progress")` returns `{"line": ...}` — the exact string the cclocal status line renders, e.g. `[claude] idle | last msg#43 sender=kimi result=succeeded in 21.5s rc=0`. It is ids, enums and numbers only, never task payload, and the call never raises.
+
 Progress files live in `systemd/runtime/<agent>.progress.json` and contain ids, enums and numbers only. The runtime directory is private and gitignored.
 
 ### Claude Code status line
 
-There is no supported API for injecting an arbitrary external event into a live Claude Code session. A supported read-side option is Claude Code's custom status line:
+There is no supported API for injecting an arbitrary external event into a live Claude Code session. A supported read-side option is Claude Code's custom status line: the command runs on a timer and its stdout becomes the status line.
+
+Create the script in the config directory your interactive sessions actually use — for this machine's cclocal setup that is `~/.claude-local` (`CLAUDE_CONFIG_DIR=$HOME/.claude-local`); on a default Claude Code install it is `~/.claude`. Use absolute paths inside, make it executable, and keep it exit 0 unconditionally — a status line command that fails or hangs degrades the whole session UI:
 
 ```bash
 #!/usr/bin/env bash
-# ~/.claude/statusline-agent-bridge.sh
-uv run --directory /absolute/path/to/agent-bridge \
-  python systemd/listener.py progress --agent claude 2>/dev/null
+# ~/.claude-local/statusline-agent-bridge.sh — one line about the claude listener.
+BRIDGE=/absolute/path/to/agent-bridge
+PY="$BRIDGE/.venv/bin/python"
+[ -x "$PY" ] || PY=python3
+"$PY" "$BRIDGE/systemd/listener.py" progress --agent claude --once 2>/dev/null
+exit 0
 ```
+
+```bash
+chmod +x ~/.claude-local/statusline-agent-bridge.sh
+```
+
+Then add this key to the `settings.json` in that same config directory, leaving every other key untouched:
 
 ```json
 {
   "statusLine": {
     "type": "command",
-    "command": "~/.claude/statusline-agent-bridge.sh",
+    "command": "/home/<user>/.claude-local/statusline-agent-bridge.sh",
     "refreshInterval": 2
   }
 }
 ```
 
-This is optional local configuration; Agent Bridge does not modify global Claude settings by itself.
+The line carries only ids, stage words, sender names, durations and exit codes. Right after a listener restart, before the first dispatch, it is just:
+
+```text
+[claude] idle
+```
+
+Once work flows, the same command grows the current-dispatch and history segments:
+
+```text
+[claude] supervising msg#33 sender=kimi supervisor=564040 for 12s
+[claude] idle | last msg#33 sender=kimi result=blocked in 938.7s rc=0
+```
+
+**Limitation:** the status line is visible only inside interactive Claude Code sessions. Outside a session there is no indication — no desktop notification, sound or dbus integration is provided, by design. A running session may not pick up `settings.json` changes mid-flight; open a new session to see the line.
+
+This is optional local configuration; Agent Bridge does not modify global Claude settings by itself — enabling it is a deliberate per-machine decision.
 
 ## Worker launchers
 
@@ -272,7 +300,7 @@ uv run python systemd/test_dispatcher.py
 
 `test_bridge.py` is a destructive end-to-end test that deletes and recreates `bridge.db`. Run it only in a disposable copy of the project before live traffic, never against a database containing real messages.
 
-Current safe suite: 44 dispatcher tests.
+Current safe suite: 48 dispatcher tests.
 
 ## Known limitations
 

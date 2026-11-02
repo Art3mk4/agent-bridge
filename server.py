@@ -552,7 +552,10 @@ def listener(action: str) -> dict[str, Any]:
     """Manage this agent's own background listener (AGENT_ID only).
 
     status: enabled/running/pid and the id of the message the listener is
-    currently waiting on — never task payload. enable: removes the disabled
+    currently waiting on — never task payload. progress: one human-readable
+    line about the current stage and the last dispatch outcome — the exact
+    same line the cclocal status line renders; ids, enums and numbers only,
+    never task payload, and the call never raises. enable: removes the disabled
     marker and idempotently starts the listener (duplicate sessions create no
     duplicate — the listener holds an exclusive flock). disable: writes the
     marker; the listener then takes no new task, lets the current worker
@@ -564,12 +567,20 @@ def listener(action: str) -> dict[str, Any]:
     mod = _get_listener()
     if act == "status":
         return mod.status(agent, str(DISPATCH_CONFIG_PATH), str(RUNTIME_DIR))
+    if act == "progress":
+        try:
+            line = mod.progress_line(agent, str(DISPATCH_CONFIG_PATH),
+                                     str(RUNTIME_DIR), str(DB_PATH))
+        except Exception:
+            line = f"[{agent}] unknown"
+        return {"line": line}
     if act == "enable":
         return mod.enable(agent, str(DB_PATH), str(DISPATCH_CONFIG_PATH),
                           str(RUNTIME_DIR), str(ON_MESSAGE))
     if act == "disable":
         return mod.disable(agent, str(DISPATCH_CONFIG_PATH), str(RUNTIME_DIR))
-    raise ValueError("action must be one of: status, enable, disable")
+    raise ValueError(
+        "action must be one of: status, progress, enable, disable")
 
 
 @mcp.tool()

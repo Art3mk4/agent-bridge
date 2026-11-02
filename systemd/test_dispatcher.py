@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import sqlite3
@@ -1206,6 +1207,11 @@ def test_14_listener_disable_enable_and_autostart_gates(d: Path):
         check("fresh status: enabled idle",
               st["enabled"] is True and st["running"] is False
               and st["pid"] is None and st["auto"] is True, str(st))
+        pr = server.listener(action="progress")
+        check("progress on fresh runtime: one stopped line",
+              isinstance(pr.get("line"), str)
+              and pr["line"].startswith("[claude]")
+              and "stopped" in pr["line"], str(pr))
         r1 = server.listener(action="enable")
         check("enable starts", r1["action"] == "started", str(r1))
         check("enable reports running",
@@ -1242,6 +1248,9 @@ def test_14_listener_disable_enable_and_autostart_gates(d: Path):
         check("explicit enable reaches running",
               wait_for(lambda: server.listener(action="status")["running"],
                        timeout=8.0))
+        pr2 = server.listener(action="progress")
+        check("progress on running listener: idle line",
+              "idle" in pr2.get("line", ""), str(pr2))
 
         try:
             server.listener(action="bogus")
@@ -2220,12 +2229,14 @@ def test_47_status_backcompat_without_progress_file(d: Path):
         check("no invented stage", st["stage"] == "unknown", str(st))
         check("progress hidden when absent", st["progress"] is None)
         check("no history yet", st["last"] is None)
-        pv = listener_cli("progress", "claude", rt, cfg=cfg)
+        pv = listener_cli("progress", "claude", rt, db=db, cfg=cfg)
         check("progress CLI works without a progress file",
               pv.returncode == 0 and "[claude] unknown msg#999" in pv.stdout,
               pv.stdout)
+        check("no sender invented for an id the database does not know",
+              "sender=" not in pv.stdout, pv.stdout)
         v = subprocess.run(
-            listener_cmd("watch", "claude", rt, cfg=cfg) + ["--once"],
+            listener_cmd("watch", "claude", rt, db=db, cfg=cfg) + ["--once"],
             capture_output=True, text=True, timeout=10, env=listener_env())
         check("watch --once prints one snapshot and exits",
               v.returncode == 0 and v.stdout.count("\n") == 1, v.stdout)
@@ -2324,6 +2335,201 @@ def test_50_blocked_report_reconcile_recover(d: Path):
           str(runs_of(d)))
 
 
+def test_51_progress_line_format_contract(d: Path):
+    # The statusline line contract, pinned end-to-end while a dispatch is in
+    # flight and after it closes: one line, stage word, msg# followed by the
+    # sender (a database lookup of ids and names — the SENTINEL task text must
+    # not reach the line), live supervisor pid and elapsed time while running,
+    # then the history segment with duration and rc. The fake supervisor files
+    # no dispatch_attempts row, so the honest verdict word stays '?'.
+    db = new_db(d)
+    cfg = write_cfg(d)
+    rt = d / "runtime"
+    env = listener_env(FAKE_SUP_LOG=str(d / "sup.log"),
+                       FAKE_SUP_PROTOCOL="1", FAKE_SUP_AGENT="claude",
+                       FAKE_SUP_DELAY="4")
+    p = spawn_listener("claude", rt, db=db, cfg=cfg,
+                       on_message=FAKE_SUPERVISOR, env=env)
+    try:
+        mid = seed(db)
+        ok = wait_for(
+            lambda: (listener_status("claude", rt, cfg).get("progress")
+                     or {}).get("stage") == "supervising", timeout=12.0)
+        check("dispatch is in flight", ok)
+        pv = listener_cli("progress", "claude", rt, db=db, cfg=cfg)
+        line = pv.stdout.strip()
+        check("in-flight output rc0 and exactly one line",
+              pv.returncode == 0 and pv.stdout.count("\n") == 1, repr(pv.stdout))
+        check("in-flight line matches the contract",
+              re.fullmatch(rf"\[claude\] supervising msg#{mid} sender=kimi"
+                           r" supervisor=\d+ for \d+s", line), line)
+        check("no payload in the line", SENTINEL not in line, line)
+        ok = wait_for(
+            lambda: (listener_status("claude", rt, cfg).get("last")
+                     or {}).get("stage") == "finished", timeout=15.0)
+        check("dispatch closed", ok)
+        line = listener_cli("progress", "claude", rt, db=db,
+                            cfg=cfg).stdout.strip()
+        check("history segment carries sender, verdict and duration/rc",
+              re.fullmatch(rf"\[claude\] idle \| last msg#{mid} sender=kimi"
+                           r" result=\? in \d+\.\d+s rc=0", line), line)
+    finally:
+        stop_listener("claude", rt, cfg, proc=p)
+
+
+def test_52_progress_line_history_and_robust(d: Path):
+    # Two faces of the same line: after a real dispatch the history segment
+    # must show the supervisor's true verdict from dispatch_attempts; against
+    # garbage (mistyped --db, corrupt database, junk progress.json, malformed
+    # config) it must degrade, never raise — rc 0 always, and a mistyped path
+    # must not CREATE a stray database (sqlite creates on connect).
+    db = new_db(d)
+    cfg = write_cfg(d)
+    rt = d / "runtime"
+    om = real_om_wrapper(d, rt)
+    p = spawn_listener("claude", rt, db=db, cfg=cfg, on_message=om,
+                       env=fake_worker_env(d, db))
+    try:
+        mid = seed(db)                       # text carries SENTINEL
+        ok = wait_for(lambda: (attempt_row(db, mid) or ("",))[0]
+                      == "succeeded", timeout=20.0)
+        check("dispatch finished for the assertions", ok)
+        line = listener_cli("progress", "claude", rt, db=db,
+                            cfg=cfg).stdout.strip()
+        check("succeeded verdict rendered from dispatch_attempts",
+              re.fullmatch(rf"\[claude\] idle \| last msg#{mid} sender=kimi"
+                           r" result=succeeded in \d+\.\d+s rc=0", line), line)
+        check("no payload in the line", SENTINEL not in line, line)
+        check("graceful stop", stop_listener("claude", rt, cfg, proc=p))
+        p = None
+        # A live-but-progress-blind listener (test_47's stand-in) so the
+        # state-file message id keeps the database lookup on the hot path.
+        # The stop left a disable marker and a trusted-by-nobody progress
+        # document behind; clear both so the expected lines stay exact.
+        (rt / "claude.disabled").unlink(missing_ok=True)
+        (rt / "claude.progress.json").unlink(missing_ok=True)
+        w = subprocess.Popen(listener_cmd("watch", "claude", rt, cfg=cfg),
+                             stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, env=listener_env())
+        try:
+            (rt / "claude.listener.pid").write_text(f"{w.pid}\n")
+            (rt / "claude.listener.state").write_text("waiting_worker:999\n")
+            typo = d / "no-such-dir" / "typo.db"
+            pv = listener_cli("progress", "claude", rt, db=typo, cfg=cfg)
+            check("mistyped --db: rc0, id kept, no sender",
+                  pv.returncode == 0
+                  and pv.stdout.strip() == "[claude] unknown msg#999",
+                  f"rc={pv.returncode} out={pv.stdout!r}")
+            check("mistyped --db creates no stray database",
+                  not typo.exists())
+            junk = d / "junk.db"
+            junk.write_bytes(b"this is not a sqlite database" * 40)
+            pv = listener_cli("progress", "claude", rt, db=junk, cfg=cfg)
+            check("corrupt database: rc0, sender degrades away",
+                  pv.returncode == 0
+                  and pv.stdout.strip() == "[claude] unknown msg#999",
+                  f"rc={pv.returncode} out={pv.stdout!r}")
+            (rt / "claude.progress.json").write_text("garbage {{{",
+                                                     encoding="utf-8")
+            pv = listener_cli("progress", "claude", rt, db=db, cfg=cfg)
+            check("junk progress.json: rc0, honest unknown",
+                  pv.returncode == 0
+                  and pv.stdout.strip() == "[claude] unknown msg#999",
+                  f"rc={pv.returncode} out={pv.stdout!r}")
+            bad_cfg = d / "bad-config.json"
+            bad_cfg.write_text("{oops", encoding="utf-8")
+            pv = listener_cli("progress", "claude", rt, db=db, cfg=bad_cfg)
+            check("malformed config: rc0 and fail-closed suffix",
+                  pv.returncode == 0
+                  and pv.stdout.strip()
+                  == "[claude] unknown msg#999 (auto off)",
+                  f"rc={pv.returncode} out={pv.stdout!r}")
+        finally:
+            w.terminate()
+            try:
+                w.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                w.kill()
+    finally:
+        if p is not None:
+            stop_listener("claude", rt, cfg, proc=p)
+
+
+def test_53_progress_line_speed(d: Path):
+    # The spec budget: a statusline repaint costs the user a terminal
+    # refresh — one snapshot must render in well under 300 ms including the
+    # sender lookup. A live listener whose pid /proc verifies, a trusted
+    # progress document (written here in the tracker's exact shape) and a
+    # seeded sender keep the whole hot path under measurement.
+    db = new_db(d)
+    cfg = write_cfg(d)
+    rt = d / "runtime"
+    rt.mkdir(parents=True, exist_ok=True)
+    mid = seed(db)
+    w = subprocess.Popen(listener_cmd("watch", "claude", rt, cfg=cfg),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, env=listener_env())
+    try:
+        (rt / "claude.listener.pid").write_text(f"{w.pid}\n")
+        (rt / "claude.progress.json").write_text(json.dumps({
+            "listener_pid": w.pid, "updated_at": time.time(),
+            "current": {"message": mid, "stage": "supervising",
+                        "supervisor_pid": w.pid + 1, "since": time.time()},
+            "last": None}), encoding="utf-8")
+        line = listener_cli("progress", "claude", rt, db=db,
+                            cfg=cfg).stdout.strip()
+        check("sender lookup engaged on the measured path",
+              f"msg#{mid} sender=kimi" in line, line)
+        worst = 0.0
+        for _ in range(5):
+            t0 = time.perf_counter()
+            pv = listener_cli("progress", "claude", rt, db=db, cfg=cfg)
+            dt = time.perf_counter() - t0
+            worst = max(worst, dt)
+            check("snapshot rc0", pv.returncode == 0)
+        check(f"snapshot under 300 ms (worst {worst * 1000:.0f} ms)",
+              worst < 0.300, f"worst={worst:.3f}s")
+    finally:
+        w.terminate()
+        try:
+            w.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            w.kill()
+
+
+def test_54_dispatcher_log_perms_0600(d: Path):
+    # P1-4: the log is created via os.open(..., 0o600) instead of umask, a
+    # legacy 0644 file is pressed down on the next write, and rotation must
+    # not leave a world-readable dispatcher.log.1 behind. The disabled marker
+    # makes run() rotate + write its one start line and exit immediately.
+    rt = d / "runtime"
+    rt.mkdir(parents=True, exist_ok=True)
+    log = rt / "dispatcher.log"
+    log.write_bytes(b"x" * 1_000_001)          # over LOG_MAX_BYTES -> rotate
+    log.chmod(0o644)                            # legacy state: created by umask
+    (rt / "claude.disabled").write_text("test\n", encoding="utf-8")
+    r = listener_cli("run", "claude", rt)
+    check("run rc0 with disabled marker", r.returncode == 0, r.stderr[-300:])
+    check("fresh dispatcher.log exists", log.exists())
+    check("fresh dispatcher.log is 0600",
+          log.stat().st_mode & 0o777 == 0o600,
+          oct(log.stat().st_mode & 0o777))
+    rot = rt / "dispatcher.log.1"
+    check("rotated log.1 exists", rot.exists())
+    check("rotated log.1 is 0600",
+          rot.stat().st_mode & 0o777 == 0o600,
+          oct(rot.stat().st_mode & 0o777))
+    # legacy press-down without rotation: a sub-threshold 0644 log must be
+    # chmod'ed back to 0600 by the next write.
+    log.chmod(0o644)
+    r2 = listener_cli("run", "claude", rt)
+    check("second run rc0", r2.returncode == 0, r2.stderr[-300:])
+    check("legacy 0644 log pressed to 0600 on write",
+          log.stat().st_mode & 0o777 == 0o600,
+          oct(log.stat().st_mode & 0o777))
+
+
 # ------------------------------------------------------------------- main
 
 def main() -> int:
@@ -2373,6 +2579,10 @@ def main() -> int:
         test_48_progress_and_status_no_payload,
         test_49_blocked_report_alt_dedup_key,
         test_50_blocked_report_reconcile_recover,
+        test_51_progress_line_format_contract,
+        test_52_progress_line_history_and_robust,
+        test_53_progress_line_speed,
+        test_54_dispatcher_log_perms_0600,
     ]
     try:
         for fn in tests:
