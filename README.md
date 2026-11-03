@@ -164,7 +164,7 @@ Start a new Kimi session from the project and trust the workspace if the MCP com
 7. sender:    mark_read([result_id])
 ```
 
-If the recipient cannot finish, it sends a `blocked: ...` result and releases the original message instead of acknowledging it. A response deadline is advisory metadata: Agent Bridge never auto-resends and never retries an attempted dispatch.
+If the recipient cannot finish, it sends a `blocked: ...` result and releases the original message instead of acknowledging it. A response deadline is advisory metadata: Agent Bridge never auto-resends and never retries an attempted dispatch, and a passed deadline does not stop a never-attempted message from being delivered.
 
 ## Bounded conversations
 
@@ -187,11 +187,16 @@ The default automation gate is:
   "auto": {
     "claude": true,
     "kimi": false
-  }
+  },
+  "dispatch_max_age_seconds": 86400
 }
 ```
 
 Claude-side headless execution is enabled by default in this configuration. Kimi-side headless execution remains disabled because Kimi CLI prompt mode applies its own automatic permission policy without interactive approvals; enable `auto.kimi` only as a deliberate local decision.
+
+`dispatch_max_age_seconds` (default 24 h) bounds automatic delivery by message **age**. A message that arrived while the listener was stopped, restarting or busy with another worker is still dispatched when it comes back, even if its `response_deadline` has passed — the deadline is metadata for the worker and the human. Only a backlog older than the bound is left alone: `listener.py pending` lists it and a manual `on_message.py <id>` runs one message on purpose.
+
+A malformed `config.json` automates nothing (fail closed).
 
 Useful commands:
 
@@ -199,6 +204,7 @@ Useful commands:
 uv run python systemd/listener.py status   --agent claude
 uv run python systemd/listener.py progress --agent claude --once
 uv run python systemd/listener.py watch    --agent claude
+uv run python systemd/listener.py pending  --agent claude
 uv run python systemd/listener.py disable  --agent claude
 uv run python systemd/listener.py enable   --agent claude
 ```
@@ -208,6 +214,8 @@ uv run python systemd/listener.py enable   --agent claude
 - `stage`: `stopped`, `unknown`, `idle`, `received` or `supervising`;
 - `progress`: the currently trusted lifecycle record;
 - `last`: the previous dispatch outcome, including duration and exit code where available.
+
+`listener pending` is a read-only backlog report: never-attempted messages that could wake a worker, split into `dispatchable` (the listener will take them) and `stale` (older than `dispatch_max_age_seconds`). It prints ids and ages only and never writes to the database.
 
 From an MCP session the same human-readable snapshot is one call: `listener(action="progress")` returns `{"line": ...}` — the exact string the cclocal status line renders, e.g. `[claude] idle | last msg#43 sender=kimi result=succeeded in 21.5s rc=0`. It is ids, enums and numbers only, never task payload, and the call never raises.
 
@@ -271,13 +279,19 @@ The supervisor chooses a launcher by recipient:
 
 For public or team use, review these launchers and adapt them to your own client wrappers and permission model. Do not weaken static deny rules or hide permission requests.
 
+Workers run in the **workspace** directory — the project both CLIs open, where their project MCP configs live (`.mcp.json` for the Claude worker's `--strict-mcp-config`, `.kimi-code/mcp.json` for Kimi). By default it is the directory that *contains* this repository, which fits a layout like `~/project/agent-bridge`. If the clone lives elsewhere, set `AGENT_BRIDGE_WORKSPACE` in the `env` of both MCP registrations; the listener and its supervisors inherit it.
+
+If a launcher cannot be started at all (missing file, wrong permissions, bad workspace), the attempt is recorded as `failed` with `error_kind=spawn:<Error>`, the sender gets the usual payload-free notice and a conversation is frozen — the message is not left silently in `spawned`.
+
 ## Reliability model
 
 - **One attempt barrier:** `dispatch_attempts.message_id` is the primary key. A rescan, restart or duplicate listener cannot launch the same message twice.
 - **No automatic retry:** crash, timeout or uncertainty remains visible for a human decision; a short operational notice is sent without task payload.
 - **Evidence-based success:** exit code 0 alone is not success. The protocol requires an acknowledged original plus the appropriate result, blocked report, follow-up or terminal conversation state.
 - **Lease and timeout:** worker claims expire; a worker timeout kills only that worker process group.
-- **Crash recovery:** stale attempts are reconciled by process evidence and report evidence. `--recover` examines only messages that have never been attempted.
+- **Delivery window:** never-attempted messages are dispatched regardless of `response_deadline`, within `dispatch_max_age_seconds`; older ones wait for a human.
+- **Crash recovery:** stale attempts are reconciled by process evidence and report evidence. A recorded worker pid only counts as alive when `/proc` shows that process started together with its attempt, so a recycled pid cannot pin an attempt in `spawned`. `--recover` examines only messages that have never been attempted and uses the same dispatch set as the listener.
+- **Concurrent start:** every process switches the database to WAL through the same retried recipe (`systemd/schema.py`), because on a not-yet-WAL file SQLite rejects the switch immediately while another writer holds a lock.
 - **Fresh database bootstrap:** the listener creates the dispatcher schema additively before scanning, so a new bridge database does not require a manual supervisor run.
 
 ## Security notes
@@ -285,7 +299,7 @@ For public or team use, review these launchers and adapt them to your own client
 - The bridge is local: MCP stdio, SQLite and local subprocesses.
 - Do not commit `bridge.db`, runtime files, outbox reports or agent MCP configuration.
 - Secrets are passed through environment variables or private files and are never written to the database, prompts, logs or progress files.
-- Logs are operational metadata only. Do not redirect MCP stderr into a file that also stores secret-bearing diagnostics.
+- Logs are operational metadata only and are created `0600` (`dispatcher.log` by both the listener and the supervisor, `errors.log` by the server). Do not redirect MCP stderr into a file that also stores secret-bearing diagnostics.
 - Claude-side workers may run with permission prompts disabled. Keep their allowlist minimal and prefer an explicit `blocked` response over any uncertain action.
 - Kimi-side automatic dispatch is deliberately gated off in the default configuration.
 - Conversations are not authorization to perform external or irreversible actions. Deployments, pushes, purchases and messages to third parties require a human decision.
@@ -300,11 +314,13 @@ uv run python systemd/test_dispatcher.py
 
 `test_bridge.py` is a destructive end-to-end test that deletes and recreates `bridge.db`. Run it only in a disposable copy of the project before live traffic, never against a database containing real messages.
 
-Current safe suite: 48 dispatcher tests.
+Current safe suite: 56 dispatcher tests, including a deterministic stress test for concurrent supervisors against a non-WAL database held by a writer.
+
+`systemd/schema.py` is the shared core of the dispatcher: DDL, the connection recipe, the `config.json` reader and the single definition of the dispatch set used by both the listener and `--recover`. Change dispatch rules there, not in the callers.
 
 ## Known limitations
 
-See [TODO.md](TODO.md). The main open item is a SQLite WAL startup race under concurrent supervisor launches; the ordinary suite can pass while a focused concurrent stress test still exposes it.
+See [TODO.md](TODO.md). The main open items are operational: minimal permissions for headless workers and visibility of `blocked` outcomes.
 
 ## License
 

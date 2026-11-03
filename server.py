@@ -34,6 +34,7 @@ ON_MESSAGE = SYSTEMD_DIR / "on_message.py"
 LISTENER_PY = SYSTEMD_DIR / "listener.py"
 DISPATCH_CONFIG_PATH = SYSTEMD_DIR / "config.json"
 RUNTIME_DIR = SYSTEMD_DIR / "runtime"
+SCHEMA_PY = SYSTEMD_DIR / "schema.py"
 AGENTS = {"kimi", "claude"}
 WORKER_ID = str(uuid.uuid4())
 MAX_WAIT_SECONDS = 30.0
@@ -51,6 +52,21 @@ MAX_CONVERSATION_TTL_SECONDS = 86400.0
 CONVERSATION_KINDS = {"task", "result", "notice"}
 
 
+def _load_by_path(name: str, path: Path) -> Any:
+    """Load a sibling module by file path (systemd/ is not a package and is
+    not on sys.path when the MCP client starts this file)."""
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load module from {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# Shared dispatcher core: WAL recipe and the 0600 log handler.
+_schema = _load_by_path("agent_bridge_schema", SCHEMA_PY)
+
+
 def _setup_logging() -> logging.Logger:
     # Diagnostics must never reach stdout: stdout carries the MCP stdio
     # protocol framing. A plain UTF-8 file next to server.py is the only
@@ -59,7 +75,9 @@ def _setup_logging() -> logging.Logger:
     # names, AGENT_ID and tracebacks.
     log = logging.getLogger("agent_bridge")
     if not log.handlers:  # idempotent across re-imports / test re-runs
-        handler = logging.FileHandler(ERROR_LOG_PATH, encoding="utf-8")
+        # 0600 like every other diagnostic file of the bridge (tracebacks
+        # carry paths and code lines, never payload, but still private).
+        handler = _schema.private_file_handler(ERROR_LOG_PATH)
         handler.setFormatter(
             logging.Formatter("%(asctime)s %(levelname)s agent_bridge: %(message)s")
         )
@@ -115,13 +133,11 @@ mcp = MCPServer("agent_bridge")
 
 
 def _connect() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH, timeout=5.0)
-    # busy_timeout must be set before journal_mode=WAL: the mode change takes
-    # an exclusive lock and without a busy handler it fails instantly when
-    # two server processes initialize at the same moment.
-    con.execute("PRAGMA busy_timeout=5000")
-    con.execute("PRAGMA journal_mode=WAL")
-    return con
+    # Shared recipe (systemd/schema.py): busy_timeout first, then a WAL
+    # switch retried by hand — on a not-yet-WAL file the switch fails at once
+    # while another writer holds a lock, busy_timeout or not. Already-WAL
+    # files (the normal case after the first start) skip the switch.
+    return _schema.connect(DB_PATH)
 
 
 def _add_column(con: sqlite3.Connection, name: str, decl: str) -> None:
@@ -137,6 +153,7 @@ def _init_db() -> None:
     # Two servers can initialize simultaneously; a journal-mode change
     # reports SQLITE_BUSY immediately (busy_timeout is not consulted for it),
     # so the whole init is retried until the file settles in WAL mode.
+    last_exc: BaseException | None = None
     for attempt in range(100):
         con = None
         try:
@@ -228,11 +245,15 @@ def _init_db() -> None:
         except sqlite3.OperationalError as exc:
             if "locked" not in str(exc).lower():
                 raise
+            last_exc = exc
             time.sleep(0.05 * (attempt + 1))
         finally:
             if con is not None:
                 con.close()
-    raise RuntimeError(f"bridge.db stayed locked during init for >~25s: {exc}")
+    # `exc` from the except clause is unbound here (Python 3 deletes it when
+    # the clause ends), so the last error is carried explicitly.
+    raise RuntimeError(
+        "bridge.db stayed locked during init for >~25s") from last_exc
 
 
 try:
@@ -433,8 +454,8 @@ def _send_conversation_message(con: sqlite3.Connection, sender: str,
             raise ValueError(
                 f"conversation {cid} is {state}: no new {kind} is allowed")
         if expires_at <= now:
-            if state == "active":
-                _transition(con, cid, "needs_human", "expired", now)
+            # state is 'active' here: any other state was rejected above.
+            _transition(con, cid, "needs_human", "expired", now)
             con.commit()
             raise ValueError(
                 f"conversation {cid} expired: moved to needs_human")
@@ -519,13 +540,7 @@ def _get_listener() -> Any:
     server import."""
     global _LISTENER_MOD
     if _LISTENER_MOD is None:
-        spec = importlib.util.spec_from_file_location(
-            "agent_bridge_listener", LISTENER_PY)
-        if spec is None or spec.loader is None:
-            raise ImportError(f"cannot load listener module from {LISTENER_PY}")
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        _LISTENER_MOD = mod
+        _LISTENER_MOD = _load_by_path("agent_bridge_listener", LISTENER_PY)
     return _LISTENER_MOD
 
 

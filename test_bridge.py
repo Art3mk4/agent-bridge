@@ -116,10 +116,11 @@ async def main() -> None:
 
         tools = sorted(t.name for t in (await kimi.list_tools()).tools)
         assert tools == [
-            "claim_message", "mark_read", "receive_messages",
-            "release_message", "send_message",
+            "claim_message", "conversation", "listener", "mark_read",
+            "receive_messages", "release_message", "send_message",
+            "start_conversation",
         ], tools
-        print("1. exactly five tools exposed:", tools)
+        print("1. exactly eight tools exposed:", tools)
 
         r = await call(kimi, "send_message", recipient="claude", text="hello claude")
         m1 = r["message_id"]
