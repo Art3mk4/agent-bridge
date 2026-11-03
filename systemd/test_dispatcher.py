@@ -352,18 +352,26 @@ def new_db(d: Path, attempts: bool = True, legacy: bool = False) -> Path:
     return db
 
 
-def write_cfg(d: Path, claude: bool = True, kimi: bool = False) -> Path:
+def write_cfg(d: Path, claude: bool = True, kimi: bool = False,
+              max_age: float | None = None) -> Path:
     cfg = d / "config.json"
-    cfg.write_text(json.dumps({"auto": {"claude": claude, "kimi": kimi}}),
-                   encoding="utf-8")
+    doc: dict = {"auto": {"claude": claude, "kimi": kimi}}
+    if max_age is not None:
+        doc["dispatch_max_age_seconds"] = max_age
+    cfg.write_text(json.dumps(doc), encoding="utf-8")
     return cfg
+
+
+TWO_DAYS = 2 * 86400.0  # older than the default dispatch_max_age_seconds
 
 
 def seed(db: Path, sender: str = "kimi", recipient: str = "claude",
          text: str | None = None, reply_to: int | None = None,
          deadline: float = 3600.0, acked: int = 0,
          claim_expires: float | None = None,
-         dedup: str | None = None) -> int:
+         dedup: str | None = None, age: float = 0.0) -> int:
+    """age shifts created_at into the past (the dispatch age bound);
+    deadline stays relative to *now* so the two are independent."""
     con = sqlite3.connect(db)
     con.execute("PRAGMA busy_timeout=5000")
     now = time.time()
@@ -373,7 +381,7 @@ def seed(db: Path, sender: str = "kimi", recipient: str = "claude",
         " VALUES (?,?,?,?,?,?,?,?,?)",
         (sender, recipient,
          text if text is not None else f"задача {SENTINEL}",
-         reply_to, now, now + deadline, acked, claim_expires, dedup),
+         reply_to, now - age, now + deadline, acked, claim_expires, dedup),
     )
     con.commit()
     mid = cur.lastrowid
@@ -517,7 +525,8 @@ def notice_row(db: Path, mid: int, prefix: str = "cclocal"):
 def sup_run(d: Path, db: Path, cfg: Path, *flags: str, mode: str = "success",
             agent: str = "claude", child: Path | None = None,
             argv_out: Path | None = None, wtimeout: str = "2",
-            extra_env: dict | None = None) -> subprocess.CompletedProcess:
+            extra_env: dict | None = None,
+            claude_launcher: Path | None = None) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env.update({
         "FAKE_PY": PY,
@@ -537,7 +546,7 @@ def sup_run(d: Path, db: Path, cfg: Path, *flags: str, mode: str = "success",
            "--db", str(db), "--config", str(cfg),
            "--runtime-dir", str(d / "runtime"),
            "--prompt-template", str(PROMPT),
-           "--claude-launcher", str(FAKE_CLAUDE_LAUNCHER),
+           "--claude-launcher", str(claude_launcher or FAKE_CLAUDE_LAUNCHER),
            "--kimi-launcher", str(FAKE_KIMI_LAUNCHER),
            "--worker-timeout", wtimeout]
     return subprocess.run(cmd, capture_output=True, text=True, timeout=60,
@@ -681,7 +690,7 @@ def test_04_auto_skips(d: Path):
     m_reply = seed(db, reply_to=1)
     m_off = seed(db)
     cfg_off = write_cfg(new_area("t04cfg"), claude=False)
-    m_dead = seed(db, deadline=-10.0)
+    m_dead = seed(db, age=TWO_DAYS)  # beyond dispatch_max_age_seconds
     m_claim = seed(db, claim_expires=time.time() + 600)
     m_ack = seed(db, acked=1)
     m_att = seed(db)
@@ -793,7 +802,8 @@ def test_11_reconcile_and_recover(d: Path):
     now = time.time()
     m_new = seed(db)                                    # recoverable
     m_unc = seed(db)                                    # has uncertain attempt
-    m_dead = seed(db, deadline=-30.0)
+    m_late = seed(db, deadline=-30.0)  # deadline passed: still delivered (P1-8)
+    m_dead = seed(db, age=TWO_DAYS)    # too old: left to a human
     m_reply = seed(db, reply_to=1)
     m_kimi = seed(db, sender="claude", recipient="kimi")
     insert_attempt(db, m_unc, "uncertain", None, now)
@@ -819,11 +829,15 @@ def test_11_reconcile_and_recover(d: Path):
 
     r = sup_run(d, db, cfg, "--recover")
     check("recover rc0", r.returncode == 0, r.stderr[-500:])
-    check("only the attemptless root ran", runs_of(d) == [f"RAN {m_new} via=stdin agent=claude"],
+    check("only the attemptless roots ran",
+          runs_of(d) == [f"RAN {m_new} via=stdin agent=claude",
+                         f"RAN {m_late} via=stdin agent=claude"],
           str(runs_of(d)))
     check("new succeeded", attempt_row(db, m_new)[0] == "succeeded")
+    check("late (deadline passed) succeeded",
+          attempt_row(db, m_late)[0] == "succeeded")
     check("uncertain untouched", attempt_row(db, m_unc)[0] == "uncertain")
-    check("expired deadline skipped", attempt_row(db, m_dead) is None)
+    check("too-old message skipped", attempt_row(db, m_dead) is None)
     check("reply skipped", attempt_row(db, m_reply) is None)
     check("kimi config-off skipped", attempt_row(db, m_kimi) is None)
     check("stale dead pid -> interrupted", attempt_row(db, s1)[0] == "interrupted")
@@ -1103,9 +1117,14 @@ os._exit(0)                                  # session process dies for real
                                                         FAKE_SUP_AGENT="claude"))
         check(f"{agent}: mcp session exited",
               r.stdout.strip() == "session-exited", r.stdout + r.stderr[-400:])
-        st = listener_status(agent, rt, cfg)  # its parent process is already dead
-        check(f"{agent}: listener alive after MCP exit",
-              bool(st["running"] and st["enabled"] and st["pid"]), str(st))
+        # Its parent process is already dead. The detached listener writes its
+        # pidfile a moment after Popen returns, so wait for it instead of
+        # sampling once (a single immediate read raced with startup).
+        alive = wait_for(lambda: bool(
+            (s := listener_status(agent, rt, cfg))["running"]
+            and s["enabled"] and s["pid"]), timeout=8.0)
+        check(f"{agent}: listener alive after MCP exit", alive,
+              str(listener_status(agent, rt, cfg)))
     # the claude listener dispatches the root task through the on_message CLI
     mid = seed(db, sender="kimi", recipient="claude")
     done = wait_for(lambda: len(supervisor_log_lines(d)) == 1, timeout=10.0)
@@ -1303,7 +1322,7 @@ def test_19_listener_e2e_claude_no_retry(d: Path):
 
 
 def test_20_listener_ignores_non_candidates(d: Path):
-    # reply_to / expired deadline / live claim / acknowledged must never wake
+    # reply_to / too-old backlog / live claim / acknowledged must never wake
     # a worker; only a fresh root task does.
     db = new_db(d)
     cfg = write_cfg(d)
@@ -1312,7 +1331,7 @@ def test_20_listener_ignores_non_candidates(d: Path):
                        on_message=FAKE_SUPERVISOR, env=fake_sup_env(d))
     try:
         seed(db, reply_to=999)                       # result-shaped
-        seed(db, deadline=-10.0)                     # expired deadline
+        seed(db, age=TWO_DAYS)                       # beyond max age
         seed(db, claim_expires=time.time() + 3600)   # live claim
         seed(db, acked=1)                            # acknowledged
         time.sleep(3.0)
@@ -2205,16 +2224,18 @@ def test_46_progress_terminal_and_stale_recovery(d: Path):
 
 
 def test_47_status_backcompat_without_progress_file(d: Path):
-    # A listener still running OLD code: /proc proves its pid, but it never
-    # writes progress.json. status() keeps every legacy key intact and answers
-    # 'unknown' — honest invisibility — instead of inventing a stage.
+    # A live listener whose progress.json is not there yet: /proc proves its
+    # pid, the file is absent. P0-3 split the old blanket 'unknown' here — a
+    # process younger than STARTING_GRACE_SECONDS is in its startup window
+    # ('starting'), and status() still keeps every pre-progress key intact
+    # and invents no stage either way.
     db = new_db(d)
     cfg = write_cfg(d)
     rt = d / "runtime"
     rt.mkdir(parents=True, exist_ok=True)
     # 'watch' is a real listener.py invocation that _listener_pid() accepts
-    # but that never dispatches and never writes progress: the stand-in for a
-    # listener built before this feature existed.
+    # but that never dispatches and never writes progress: the stand-in for
+    # a listener between the pidfile write and the tracker's first flush.
     w = subprocess.Popen(listener_cmd("watch", "claude", rt, cfg=cfg),
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, env=listener_env())
@@ -2226,12 +2247,14 @@ def test_47_status_backcompat_without_progress_file(d: Path):
               st["agent"] == "claude" and st["enabled"] is True
               and st["running"] is True and st["pid"] == w.pid
               and st["message"] == 999 and st["auto"] is True, str(st))
-        check("no invented stage", st["stage"] == "unknown", str(st))
+        check("young listener without a file is 'starting'",
+              st["stage"] == "starting" and st["progress_state"] is None,
+              str(st))
         check("progress hidden when absent", st["progress"] is None)
         check("no history yet", st["last"] is None)
         pv = listener_cli("progress", "claude", rt, db=db, cfg=cfg)
         check("progress CLI works without a progress file",
-              pv.returncode == 0 and "[claude] unknown msg#999" in pv.stdout,
+              pv.returncode == 0 and "[claude] starting msg#999" in pv.stdout,
               pv.stdout)
         check("no sender invented for an id the database does not know",
               "sender=" not in pv.stdout, pv.stdout)
@@ -2266,6 +2289,8 @@ def test_48_progress_and_status_no_payload(d: Path):
         doc = (rt / "claude.progress.json").read_text(errors="replace")
         check("progress file free of payload", SENTINEL not in doc,
               doc[-300:])
+        check("progress document carries the format marker",
+              json.loads(doc).get("format_version") == 2, doc[:200])
         log = (rt / "dispatcher.log").read_text(errors="replace") \
             if (rt / "dispatcher.log").exists() else ""
         check("dispatcher log free of payload", SENTINEL not in log)
@@ -2419,7 +2444,7 @@ def test_52_progress_line_history_and_robust(d: Path):
             pv = listener_cli("progress", "claude", rt, db=typo, cfg=cfg)
             check("mistyped --db: rc0, id kept, no sender",
                   pv.returncode == 0
-                  and pv.stdout.strip() == "[claude] unknown msg#999",
+                  and pv.stdout.strip() == "[claude] starting msg#999",
                   f"rc={pv.returncode} out={pv.stdout!r}")
             check("mistyped --db creates no stray database",
                   not typo.exists())
@@ -2428,14 +2453,14 @@ def test_52_progress_line_history_and_robust(d: Path):
             pv = listener_cli("progress", "claude", rt, db=junk, cfg=cfg)
             check("corrupt database: rc0, sender degrades away",
                   pv.returncode == 0
-                  and pv.stdout.strip() == "[claude] unknown msg#999",
+                  and pv.stdout.strip() == "[claude] starting msg#999",
                   f"rc={pv.returncode} out={pv.stdout!r}")
             (rt / "claude.progress.json").write_text("garbage {{{",
                                                      encoding="utf-8")
             pv = listener_cli("progress", "claude", rt, db=db, cfg=cfg)
-            check("junk progress.json: rc0, honest unknown",
+            check("junk progress.json: rc0, honest error",
                   pv.returncode == 0
-                  and pv.stdout.strip() == "[claude] unknown msg#999",
+                  and pv.stdout.strip() == "[claude] error msg#999",
                   f"rc={pv.returncode} out={pv.stdout!r}")
             bad_cfg = d / "bad-config.json"
             bad_cfg.write_text("{oops", encoding="utf-8")
@@ -2443,7 +2468,7 @@ def test_52_progress_line_history_and_robust(d: Path):
             check("malformed config: rc0 and fail-closed suffix",
                   pv.returncode == 0
                   and pv.stdout.strip()
-                  == "[claude] unknown msg#999 (auto off)",
+                  == "[claude] error msg#999 (auto off)",
                   f"rc={pv.returncode} out={pv.stdout!r}")
         finally:
             w.terminate()
@@ -2473,7 +2498,8 @@ def test_53_progress_line_speed(d: Path):
     try:
         (rt / "claude.listener.pid").write_text(f"{w.pid}\n")
         (rt / "claude.progress.json").write_text(json.dumps({
-            "listener_pid": w.pid, "updated_at": time.time(),
+            "format_version": 2, "listener_pid": w.pid,
+            "updated_at": time.time(),
             "current": {"message": mid, "stage": "supervising",
                         "supervisor_pid": w.pid + 1, "since": time.time()},
             "last": None}), encoding="utf-8")
@@ -2530,6 +2556,330 @@ def test_54_dispatcher_log_perms_0600(d: Path):
           oct(log.stat().st_mode & 0o777))
 
 
+# ------------------------------------------------ review-fix regressions
+
+def _load_schema_mod():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("t_schema", HERE / "schema.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_55_listener_delivers_after_deadline(d: Path):
+    # P1-8: a message whose response_deadline passed while the listener was
+    # away is still delivered; only the age bound holds a backlog back.
+    db = new_db(d)
+    cfg = write_cfg(d, max_age=60)
+    rt = d / "runtime"
+    m_old = seed(db, age=120.0)                 # beyond the 60 s bound
+    m_late = seed(db, deadline=-10.0, age=5.0)  # deadline gone, still young
+    p = spawn_listener("claude", rt, db=db, cfg=cfg,
+                       on_message=FAKE_SUPERVISOR, env=fake_sup_env(d))
+    try:
+        check("late message dispatched", wait_for(
+            lambda: len(supervisor_log_lines(d)) >= 1, timeout=10.0))
+        time.sleep(2.5)
+        lines = supervisor_log_lines(d)
+        check("exactly one dispatch", len(lines) == 1, str(lines))
+        check("dispatched the late one, not the old one",
+              bool(lines) and lines[0].startswith(f"{m_late} --db"), str(lines))
+        check("old message never attempted", attempt_row(db, m_old) is None)
+    finally:
+        stop_listener("claude", rt, cfg, proc=p)
+
+
+def test_56_concurrent_supervisors_vs_nonwal_writer(d: Path):
+    # P0-1: on a not-yet-WAL database the journal-mode switch fails at once
+    # while another connection holds RESERVED (busy_timeout is ignored for
+    # it). Six supervisors started under a held write lock must all survive.
+    import threading
+    db = new_db(d)
+    cfg = write_cfg(d, claude=False)
+    mode = q1(db, "PRAGMA journal_mode")[0]
+    check("precondition: rollback journal", str(mode).lower() != "wal", mode)
+    holder = sqlite3.connect(db, isolation_level=None, check_same_thread=False)
+    holder.execute("BEGIN IMMEDIATE")
+    holder.execute("INSERT INTO messages (sender, recipient, text, created_at)"
+                   " VALUES ('kimi', 'claude', 'held', ?)", (time.time(),))
+    t = threading.Timer(1.5, lambda: holder.execute("COMMIT"))
+    t.start()
+    cmd = [PY, str(ON_MESSAGE), "--recover", "--db", str(db),
+           "--config", str(cfg), "--runtime-dir", str(d / "runtime")]
+    procs = [subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.PIPE) for _ in range(6)]
+    rcs = []
+    for pr in procs:
+        _out, err = pr.communicate(timeout=60)
+        rcs.append(pr.returncode)
+    t.join()
+    holder.close()
+    check("every supervisor exited 0", rcs == [0] * 6, str(rcs))
+    check("database ended in WAL",
+          str(q1(db, "PRAGMA journal_mode")[0]).lower() == "wal")
+
+
+def test_57_supervisor_log_created_0600(d: Path):
+    # P1-4 (supervisor side): on_message often writes dispatcher.log first;
+    # it must create it 0600 and press a legacy 0644 file down.
+    db = new_db(d)
+    cfg = write_cfg(d)
+    log = d / "runtime" / "dispatcher.log"
+    r = sup_run(d, db, cfg, 999, "--auto")      # not found -> skip, logs
+    check("skip rc0", r.returncode == 0, r.stderr[-300:])
+    check("log exists", log.exists())
+    check("fresh supervisor log 0600", log.stat().st_mode & 0o777 == 0o600,
+          oct(log.stat().st_mode & 0o777))
+    log.chmod(0o644)
+    sup_run(d, db, cfg, 998, "--auto")
+    check("legacy 0644 pressed to 0600", log.stat().st_mode & 0o777 == 0o600,
+          oct(log.stat().st_mode & 0o777))
+
+
+def test_58_spawn_failure_is_reported(d: Path):
+    # A launcher that cannot start must not leave a silent 'spawned' row:
+    # failed + payload-free notice + frozen conversation, rc 3.
+    db = new_db(d)
+    cfg = write_cfg(d)
+    missing = d / "no-such-launcher.sh"
+    cid, mid = seed_conv(db)
+    r = sup_run(d, db, cfg, mid, "--auto", claude_launcher=missing)
+    check("rc3", r.returncode == 3, r.stderr[-400:])
+    a = attempt_row(db, mid)
+    check("attempt failed", a is not None and a[0] == "failed", str(a))
+    check("error kind names the spawn error",
+          a is not None and str(a[3]).startswith("spawn:"), str(a))
+    check("notice sent", notice_row(db, mid) is not None)
+    check("conversation frozen", conv_state(db, cid) == "blocked")
+    mid2 = seed(db)
+    r2 = sup_run(d, db, cfg, mid2, "--auto", claude_launcher=missing)
+    check("legacy rc3", r2.returncode == 3)
+    check("legacy attempt failed", attempt_row(db, mid2)[0] == "failed")
+    n = notice_row(db, mid2)
+    check("legacy notice without payload",
+          n is not None and SENTINEL not in n[1])
+    check("no payload in log",
+          SENTINEL not in (d / "runtime" / "dispatcher.log").read_text(
+              errors="replace"))
+
+
+def test_59_reconcile_ignores_recycled_pid(d: Path):
+    # A live pid that started long before the attempt row is not our worker
+    # (recycled pid): the stale attempt must be reconciled, while a worker
+    # that really started with its attempt is left alone.
+    if not Path("/proc/self/stat").exists():
+        return
+    db = new_db(d)
+    cfg = write_cfg(d, claude=False)
+    m_recycled = seed(db)
+    # this test runner has been alive for a while: it predates the row
+    insert_attempt(db, m_recycled, "spawned", os.getpid(), time.time())
+    m_live = seed(db)
+    t0 = time.time()
+    child = subprocess.Popen(["sleep", "30"])
+    try:
+        insert_attempt(db, m_live, "spawned", child.pid, t0)
+        r = sup_run(d, db, cfg, "--recover")
+        check("recover rc0", r.returncode == 0, r.stderr[-300:])
+        check("recycled pid -> interrupted",
+              attempt_row(db, m_recycled)[0] == "interrupted",
+              str(attempt_row(db, m_recycled)))
+        check("real live worker left spawned",
+              attempt_row(db, m_live)[0] == "spawned",
+              str(attempt_row(db, m_live)))
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_60_pending_report(d: Path):
+    # Read-only backlog view: dispatchable vs stale, ids and ages only.
+    db = new_db(d)
+    cfg = write_cfg(d, max_age=3600)
+    rt = d / "runtime"
+    fresh = seed(db, deadline=-60.0)
+    stale = seed(db, age=7200.0)
+    seed(db, reply_to=fresh)                     # not a candidate
+    tried = seed(db)
+    insert_attempt(db, tried, "failed", None, time.time())
+    before = db.stat().st_mtime_ns
+    r = listener_cli("pending", "claude", rt, db=db, cfg=cfg)
+    check("pending rc0", r.returncode == 0, r.stderr[-300:])
+    doc = json.loads(r.stdout)
+    check("dispatchable is the fresh one",
+          [x["message"] for x in doc["dispatchable"]] == [fresh], r.stdout)
+    check("stale is the old one",
+          [x["message"] for x in doc["stale"]] == [stale], r.stdout)
+    check("no payload", SENTINEL not in r.stdout)
+    check("database not written", db.stat().st_mtime_ns == before)
+    missing = d / "nope.db"
+    r2 = listener_cli("pending", "claude", rt, db=missing, cfg=cfg)
+    check("missing db reported",
+          json.loads(r2.stdout).get("error") == "no_database", r2.stdout)
+    check("missing db not created", not missing.exists())
+
+
+def test_61_config_reader_and_workspace(d: Path):
+    sm = _load_schema_mod()
+    cfg, err = sm.load_dispatch_config(d / "absent.json")
+    check("missing -> defaults", cfg["auto"] == {"claude": True, "kimi": False}
+          and cfg["max_age_seconds"] == 86400.0 and err is None, str(cfg))
+    bad = d / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    cfg, err = sm.load_dispatch_config(bad)
+    check("malformed fails closed", not any(cfg["auto"].values())
+          and err == "JSONDecodeError", f"{cfg} {err}")
+    weird = d / "weird.json"
+    weird.write_text(json.dumps({"auto": ["claude"]}), encoding="utf-8")
+    cfg, err = sm.load_dispatch_config(weird)
+    check("non-object auto fails closed", not any(cfg["auto"].values())
+          and err is not None, f"{cfg} {err}")
+    neg = write_cfg(new_area("t61neg"), max_age=-5)
+    check("non-positive age -> default",
+          sm.load_dispatch_config(neg)[0]["max_age_seconds"] == 86400.0)
+    ok = write_cfg(new_area("t61ok"), kimi=True, max_age=90)
+    cfg, err = sm.load_dispatch_config(ok)
+    check("valid config read", cfg["auto"] == {"claude": True, "kimi": True}
+          and cfg["max_age_seconds"] == 90.0 and err is None, str(cfg))
+    # AGENT_BRIDGE_WORKSPACE moves the worker cwd for clones that do not
+    # live inside the project directory.
+    code = ("import importlib.util,sys;"
+            "s=importlib.util.spec_from_file_location('om',sys.argv[1]);"
+            "m=importlib.util.module_from_spec(s);s.loader.exec_module(m);"
+            "print(m.WORKSPACE);print(m.parse_args(['1']).mcp_config)")
+    env = dict(os.environ, AGENT_BRIDGE_WORKSPACE=str(d))
+    r = subprocess.run([PY, "-c", code, str(ON_MESSAGE)], env=env,
+                       capture_output=True, text=True, timeout=30)
+    lines = r.stdout.splitlines()
+    check("workspace override", lines[:1] == [str(d.resolve())], r.stdout + r.stderr)
+    check("mcp config follows workspace",
+          lines[1:2] == [str(d.resolve() / ".mcp.json")], r.stdout)
+    env.pop("AGENT_BRIDGE_WORKSPACE")
+    r = subprocess.run([PY, "-c", code, str(ON_MESSAGE)], env=env,
+                       capture_output=True, text=True, timeout=30)
+    check("default workspace is the repo parent",
+          r.stdout.splitlines()[:1] == [str(ROOT.parent)], r.stdout)
+
+
+def test_62_server_init_lock_raises_runtimeerror(d: Path):
+    # The 100-retry init used to end in NameError (`exc` is unbound after its
+    # except clause); it must be a RuntimeError chained to the lock error.
+    import types
+    server = import_server(d / "errors.log")
+    orig_connect, orig_time = server._connect, server.time
+
+    def locked():
+        raise sqlite3.OperationalError("database is locked")
+
+    server._connect = locked
+    server.time = types.SimpleNamespace(sleep=lambda _s: None, time=time.time)
+    try:
+        try:
+            server._init_db()
+            check("init raised", False, "no exception")
+        except RuntimeError as exc:
+            check("chained to the lock error",
+                  isinstance(exc.__cause__, sqlite3.OperationalError),
+                  repr(exc.__cause__))
+        except Exception as exc:  # noqa: BLE001
+            check("RuntimeError, not " + type(exc).__name__, False)
+    finally:
+        server._connect, server.time = orig_connect, orig_time
+
+
+def test_63_status_stage_causes(d: Path):
+    # P0-3: the causes the old blanket 'unknown' collapsed are now each named.
+    # status() runs in-process against the real module (the stand-in must be a
+    # real listener.py process for _listener_pid's /proc check; the young
+    # process keeps the 'starting' window honest), and each branch is driven
+    # by writing nothing but runtime files.
+    db = new_db(d)
+    cfg = write_cfg(d)
+    rt = d / "runtime"
+    rt.mkdir(parents=True, exist_ok=True)
+    server = import_server(d / "server_errors.log")
+    os.environ["AGENT_ID"] = "claude"
+    mod = server._get_listener()
+    w = subprocess.Popen(listener_cmd("watch", "claude", rt, cfg=cfg),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, env=listener_env())
+    prog = rt / "claude.progress.json"
+    try:
+        (rt / "claude.listener.pid").write_text(f"{w.pid}\n")
+        st = mod.status("claude", str(cfg), rt)
+        check("no file + young process -> starting",
+              st["stage"] == "starting" and st["progress_state"] is None,
+              str(st))
+        old_grace = mod.STARTING_GRACE_SECONDS
+        mod.STARTING_GRACE_SECONDS = -1.0
+        try:
+            st = mod.status("claude", str(cfg), rt)
+            check("no file + process past the grace -> legacy/missing_file",
+                  st["stage"] == "legacy"
+                  and st["progress_state"] == "missing_file", str(st))
+        finally:
+            mod.STARTING_GRACE_SECONDS = old_grace
+        prog.write_text(json.dumps({
+            "listener_pid": w.pid, "updated_at": time.time(),
+            "current": None, "last": None}), encoding="utf-8")
+        st = mod.status("claude", str(cfg), rt)
+        check("document without the marker -> legacy/no_format_version",
+              st["stage"] == "legacy"
+              and st["progress_state"] == "no_format_version", str(st))
+        # A foreign pid must win over the marker check: an old listener's
+        # unmarked document left under a recycled pid says nothing about
+        # anybody, while its `last` is still real history for this agent.
+        prog.write_text(json.dumps({
+            "listener_pid": w.pid + 4242, "updated_at": time.time(),
+            "current": {"message": 123, "stage": "supervising",
+                        "supervisor_pid": 1, "since": time.time()},
+            "last": {"message": 42, "stage": "finished",
+                     "result": "succeeded", "supervisor_rc": 0,
+                     "duration_s": 1.0}}), encoding="utf-8")
+        st = mod.status("claude", str(cfg), rt)
+        check("foreign pid checked before the marker -> unknown/stale_pid",
+              st["stage"] == "unknown"
+              and st["progress_state"] == "stale_pid", str(st))
+        check("untrusted current stays hidden", st["progress"] is None,
+              str(st))
+        check("stale document still tells the true history",
+              (st["last"] or {}).get("message") == 42, str(st["last"]))
+        prog.write_text("garbage {{{", encoding="utf-8")
+        st = mod.status("claude", str(cfg), rt)
+        check("unreadable document -> error/unreadable",
+              st["stage"] == "error"
+              and st["progress_state"] == "unreadable", str(st))
+        prog.write_text(json.dumps({
+            "format_version": 2, "listener_pid": w.pid,
+            "updated_at": time.time(),
+            "current": {"message": 55, "stage": "supervising",
+                        "supervisor_pid": w.pid + 1, "since": time.time()},
+            "last": None}), encoding="utf-8")
+        st = mod.status("claude", str(cfg), rt)
+        check("trusted marked document reports its own stage",
+              st["stage"] == "supervising" and st["progress_state"] is None
+              and (st["progress"] or {}).get("message") == 55, str(st))
+        # The new stage words also reach the compact statusline surface.
+        prog.write_text("garbage {{{", encoding="utf-8")
+        pv = listener_cli("progress", "claude", rt, db=db, cfg=cfg)
+        check("compact line renders 'error'",
+              pv.returncode == 0 and pv.stdout.strip() == "[claude] error",
+              f"rc={pv.returncode} out={pv.stdout!r}")
+        prog.write_text(json.dumps({
+            "listener_pid": w.pid, "updated_at": time.time(),
+            "current": None, "last": None}), encoding="utf-8")
+        pv = listener_cli("progress", "claude", rt, db=db, cfg=cfg)
+        check("compact line renders 'legacy'",
+              pv.returncode == 0 and pv.stdout.strip() == "[claude] legacy",
+              f"rc={pv.returncode} out={pv.stdout!r}")
+    finally:
+        w.terminate()
+        try:
+            w.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            w.kill()
+
+
 # ------------------------------------------------------------------- main
 
 def main() -> int:
@@ -2583,6 +2933,15 @@ def main() -> int:
         test_52_progress_line_history_and_robust,
         test_53_progress_line_speed,
         test_54_dispatcher_log_perms_0600,
+        test_55_listener_delivers_after_deadline,
+        test_56_concurrent_supervisors_vs_nonwal_writer,
+        test_57_supervisor_log_created_0600,
+        test_58_spawn_failure_is_reported,
+        test_59_reconcile_ignores_recycled_pid,
+        test_60_pending_report,
+        test_61_config_reader_and_workspace,
+        test_62_server_init_lock_raises_runtimeerror,
+        test_63_status_stage_causes,
     ]
     try:
         for fn in tests:

@@ -49,7 +49,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import signal
@@ -62,7 +61,12 @@ from typing import Any
 
 HERE = Path(__file__).resolve().parent        # agent_bridge/systemd
 ROOT = HERE.parent                            # agent_bridge
-WORKSPACE = ROOT.parent                       # vibe_coding (both CLIs' project)
+# Worker cwd: the project both CLIs open (their project MCP configs live
+# there). Defaults to the directory that contains this repository; set
+# AGENT_BRIDGE_WORKSPACE (e.g. in the MCP server env) when the clone lives
+# elsewhere — the listener and its supervisors inherit that environment.
+WORKSPACE = Path(os.path.expanduser(
+    os.environ.get("AGENT_BRIDGE_WORKSPACE") or str(ROOT.parent))).resolve()
 
 AGENT_PREFIX = {"claude": "cclocal", "kimi": "kimi"}
 WORKER_LABEL = {
@@ -96,7 +100,10 @@ NOTIFY_STATES = {STATE_FAILED, STATE_TIMEOUT, STATE_INTERRUPTED, STATE_UNCERTAIN
 WORKER_TIMEOUT_SECONDS = 3300.0  # 55 min, under the worker's 60-min claim lease
 OUTPUT_KEEP = 20
 SPAWN_GRACE_SECONDS = 60.0       # 'spawned' without pid younger than this: alive
-DEFAULT_AUTO = {"claude": True, "kimi": False}
+# A recorded worker pid only counts as "our worker, still running" if /proc
+# says that process started within this window around the attempt row —
+# a recycled pid belongs to a process started much later.
+PID_START_SLACK_SECONDS = 2.0
 
 # Bounded conversation context for the worker prompt: the reviewer needs the
 # goal and recent history, but a prompt must never grow with the dialogue.
@@ -113,8 +120,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="process root messages that never got an attempt row "
                         "and reconcile stale attempts; never reruns attempted ones")
     p.add_argument("--auto", action="store_true",
-                   help="automatic mode (set by the server hook): enforce the "
-                        "config gate, root-only and live-deadline checks")
+                   help="automatic mode (set by the listener): enforce the "
+                        "config gate, root-only/live-conversation and "
+                        "message-age checks")
     p.add_argument("--db", default=str(ROOT / "bridge.db"))
     p.add_argument("--config", default=str(HERE / "config.json"))
     p.add_argument("--runtime-dir", default=str(HERE / "runtime"))
@@ -133,12 +141,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _connect(db: str) -> sqlite3.Connection:
-    # Same pragmas as server.py: busy_timeout before WAL, because the
-    # journal-mode change takes a lock and ignores busy_timeout otherwise.
-    con = sqlite3.connect(db, timeout=5.0)
-    con.execute("PRAGMA busy_timeout=5000")
-    con.execute("PRAGMA journal_mode=WAL")
-    return con
+    # Shared recipe (schema.connect): busy_timeout first, then a WAL switch
+    # that is retried by hand — on a not-yet-WAL file the switch fails at
+    # once while another writer holds a lock, busy_timeout or not (P0-1).
+    return _schema_mod().connect(db)
 
 
 _SCHEMA_MOD: Any = None
@@ -177,7 +183,9 @@ def _setup_logging(runtime_dir: Path) -> logging.Logger:
     if not log.handlers:
         log.setLevel(logging.INFO)
         fmt = logging.Formatter("%(asctime)s %(levelname)s supervisor: %(message)s")
-        fh = logging.FileHandler(runtime_dir / "dispatcher.log", encoding="utf-8")
+        # 0600 from creation (P1-4): the supervisor often writes the shared
+        # log first, and a plain FileHandler would create it by umask.
+        fh = _schema_mod().private_file_handler(runtime_dir / "dispatcher.log")
         fh.setFormatter(fmt)
         sh = logging.StreamHandler(sys.stderr)
         sh.setFormatter(fmt)
@@ -187,17 +195,19 @@ def _setup_logging(runtime_dir: Path) -> logging.Logger:
     return log
 
 
-def _auto_enabled(config_path: str, recipient: str, log: logging.Logger) -> bool:
+def _load_config(config_path: str, log: logging.Logger) -> dict[str, Any]:
     # config.json is optional: the default automates only claude. A broken
-    # config automates nothing (fail closed) and is logged without content.
-    try:
-        cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
-        return bool(cfg.get("auto", DEFAULT_AUTO).get(recipient, False))
-    except FileNotFoundError:
-        return DEFAULT_AUTO.get(recipient, False)
-    except Exception:
-        log.exception("unreadable dispatch config, automation disabled")
-        return False
+    # config automates nothing (fail closed) and is logged by exception type
+    # only — never its content. Same reader as the listener's.
+    cfg, err = _schema_mod().load_dispatch_config(config_path)
+    if err is not None:
+        log.error("unreadable dispatch config (kind=%s), automation disabled",
+                  err)
+    return cfg
+
+
+def _auto_enabled(config_path: str, recipient: str, log: logging.Logger) -> bool:
+    return bool(_load_config(config_path, log)["auto"].get(recipient, False))
 
 
 _MSG_COLS = ("id, sender, recipient, text, reply_to, created_at,"
@@ -224,11 +234,7 @@ def _fetch_message(con: sqlite3.Connection, message_id: int) -> tuple | None:
 
 def _conv_schema(con: sqlite3.Connection) -> bool:
     # True when the additive conversations layer exists in this DB.
-    if con.execute("SELECT 1 FROM sqlite_master WHERE type='table'"
-                   " AND name='conversations'").fetchone() is None:
-        return False
-    return any(r[1] == "kind" for r in
-               con.execute("PRAGMA table_info(messages)"))
+    return _schema_mod().has_conversations(con)
 
 
 class Skip(Exception):
@@ -240,7 +246,7 @@ def _validate(con: sqlite3.Connection, message_id: int, auto: bool,
     row = _fetch_message(con, message_id)
     if row is None:
         raise Skip(f"message {message_id} not found")
-    (_id, _sender, recipient, _text, reply_to, _created, deadline,
+    (_id, _sender, recipient, _text, reply_to, created, deadline,
      acked, claim_expires, conversation_id, kind, _turn) = row
     if recipient not in AGENT_PREFIX:
         raise Skip(f"message {message_id}: recipient {recipient!r} is not an agent")
@@ -275,14 +281,19 @@ def _validate(con: sqlite3.Connection, message_id: int, auto: bool,
         elif reply_to is not None:
             # Legacy anti-loop barrier: only root tasks may wake a worker.
             raise Skip(f"message {message_id} is a reply, root tasks only")
-        if not deadline or deadline <= time.time():
-            raise Skip(f"message {message_id} has no live response_deadline")
-        if not _auto_enabled(args.config, recipient, log):
+        # response_deadline is metadata, not a dispatch gate (P1-8): a
+        # message that arrived while the listener was down is still
+        # delivered. Only an old backlog waits for a human.
+        cfg = _load_config(args.config, log)
+        if created is None or created < time.time() - cfg["max_age_seconds"]:
+            raise Skip(f"message {message_id} is older than "
+                       f"dispatch_max_age_seconds, leaving it to a human")
+        if not cfg["auto"].get(recipient, False):
             raise Skip(f"message {message_id}: recipient {recipient} disabled by config")
     else:
         log.info("manual mode for message %s: auto gates bypassed (root=%s,"
-                 " deadline_ok=%s)", message_id, reply_to is None,
-                 bool(deadline and deadline > time.time()))
+                 " deadline_passed=%s)", message_id, reply_to is None,
+                 bool(deadline is not None and deadline <= time.time()))
     return row
 
 
@@ -529,16 +540,19 @@ def _run_worker(args: argparse.Namespace, con: sqlite3.Connection, row: tuple,
     out_fd = os.open(out_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
     env = os.environ.copy()  # each launcher rebuilds its own client env
     env.update(extra_env)
-    proc = subprocess.Popen(  # no shell=True, direct argv
-        argv,
-        stdin=(subprocess.PIPE if prompt_stdin is not None else subprocess.DEVNULL),
-        stdout=out_fd,
-        stderr=subprocess.STDOUT,
-        cwd=args.workspace,
-        start_new_session=True,  # own process group, killed as a whole on timeout
-        env=env,
-    )
-    os.close(out_fd)
+    try:
+        proc = subprocess.Popen(  # no shell=True, direct argv
+            argv,
+            stdin=(subprocess.PIPE if prompt_stdin is not None
+                   else subprocess.DEVNULL),
+            stdout=out_fd,
+            stderr=subprocess.STDOUT,
+            cwd=args.workspace,
+            start_new_session=True,  # own group, killed as a whole on timeout
+            env=env,
+        )
+    finally:
+        os.close(out_fd)
     _rotate_outputs(runtime_dir)  # after the current file exists: dir keeps ≤20
     con.execute(
         "UPDATE dispatch_attempts SET pid = ? WHERE message_id = ?",
@@ -744,7 +758,25 @@ def _notify_sender(con: sqlite3.Connection, row: tuple, state: str,
         pass  # notice for this message already delivered (dedup)
 
 
-def _pid_alive(pid: int | None) -> bool:
+def _proc_start(pid: int) -> tuple[str, float] | None:
+    """(state letter, start time as epoch seconds) from /proc, or None when
+    /proc cannot say. Parsing lives in schema.proc_info (shared with the
+    listener); the start is derived from the process age."""
+    info = _schema_mod().proc_info(pid)
+    if info is None:
+        return None
+    state, age = info
+    return state, time.time() - age
+
+
+def _pid_alive(pid: int | None, started_at: float | None = None) -> bool:
+    """Is the recorded worker still running?
+
+    os.kill(pid, 0) alone cannot tell our worker from an unrelated process
+    that later got the same pid, which would keep a dead attempt in
+    'spawned' forever. Where /proc is available the process must also not be
+    a zombie and must have started inside the window between the attempt row
+    and the spawn grace — a recycled pid starts much later than that."""
     if pid is None or pid <= 0:
         return False
     try:
@@ -752,8 +784,17 @@ def _pid_alive(pid: int | None) -> bool:
     except ProcessLookupError:
         return False
     except PermissionError:
+        pass
+    info = _proc_start(pid)
+    if info is None:
+        return True  # no /proc evidence either way: keep the old behaviour
+    state, start = info
+    if state in ("Z", "X"):
+        return False
+    if started_at is None:
         return True
-    return True
+    return (started_at - PID_START_SLACK_SECONDS <= start
+            <= started_at + SPAWN_GRACE_SECONDS)
 
 
 def _reconcile(con: sqlite3.Connection, log: logging.Logger) -> None:
@@ -768,7 +809,7 @@ def _reconcile(con: sqlite3.Connection, log: logging.Logger) -> None:
         "SELECT message_id, pid, started_at FROM dispatch_attempts"
         " WHERE state = ?", (STATE_SPAWNED,)
     ).fetchall():
-        if _pid_alive(pid):
+        if _pid_alive(pid, started_at):
             continue  # worker still running (possibly a sibling supervisor's)
         if pid is None and time.time() - started_at < SPAWN_GRACE_SECONDS:
             continue
@@ -809,7 +850,19 @@ def _process_message(con: sqlite3.Connection, message_id: int,
         log.info("attempt already exists, skipping message_id=%s", message_id)
         return 0
     log.info("dispatching message_id=%s recipient=%s", message_id, row[2])
-    exit_code, timed_out = _run_worker(args, con, row, runtime_dir, log)
+    try:
+        exit_code, timed_out = _run_worker(args, con, row, runtime_dir, log)
+    except OSError as exc:
+        # The worker never started (missing/non-executable launcher, bad
+        # workspace, unreadable prompt template). Without this the attempt
+        # stayed 'spawned' until a later reconcile relabelled it
+        # 'interrupted' — and the sender was never told.
+        kind = type(exc).__name__
+        log.error("worker spawn failed message_id=%s kind=%s", message_id, kind)
+        _finish_attempt(con, message_id, STATE_FAILED, None, f"spawn:{kind}")
+        _mark_conversation_blocked(con, row[9], log)
+        _notify_sender(con, row, STATE_FAILED, log)
+        return 3
     state = _classify(con, message_id, row[2], exit_code, timed_out)
     error_kind = None if state == STATE_SUCCEEDED else f"exit={exit_code}"
     _finish_attempt(con, message_id, state, exit_code, error_kind)
@@ -828,53 +881,19 @@ def _recover(con: sqlite3.Connection, args: argparse.Namespace,
              log: logging.Logger) -> int:
     # Only provably-never-started work: messages WITHOUT any attempt row.
     # Stale attempts are only classified by _reconcile above, never rerun.
-    now = time.time()
-    if _conv_schema(con):
-        # Must match the listener's dispatch set exactly: legacy root tasks
-        # plus 'task'/'result' of still-active unexpired conversations.
-        rows = con.execute(
-            "SELECT m.id FROM messages AS m"
-            " LEFT JOIN conversations c ON c.id = m.conversation_id"
-            " WHERE m.recipient IN ('claude', 'kimi') AND m.acknowledged = 0"
-            "   AND (m.claim_expires_at IS NULL OR m.claim_expires_at <= ?)"
-            "   AND m.response_deadline IS NOT NULL AND m.response_deadline > ?"
-            "   AND ((m.conversation_id IS NULL AND m.kind IS NULL"
-            "         AND m.reply_to IS NULL)"
-            "        OR (m.conversation_id IS NOT NULL"
-            "            AND m.kind IN ('task','result')"
-            "            AND c.state = 'active' AND c.expires_at > ?))"
-            "   AND NOT EXISTS"
-            "       (SELECT 1 FROM dispatch_attempts a WHERE a.message_id = m.id)"
-            " ORDER BY m.id",
-            (now, now, now),
-        ).fetchall()
-    else:
-        rows = con.execute(
-            "SELECT m.id FROM messages AS m"
-            " WHERE m.recipient IN ('claude', 'kimi') AND m.acknowledged = 0"
-            "   AND m.reply_to IS NULL"
-            "   AND (m.claim_expires_at IS NULL OR m.claim_expires_at <= ?)"
-            "   AND m.response_deadline IS NOT NULL AND m.response_deadline > ?"
-            "   AND NOT EXISTS"
-            "       (SELECT 1 FROM dispatch_attempts a WHERE a.message_id = m.id)"
-            " ORDER BY m.id",
-            (now, now),
-        ).fetchall()
+    # Same dispatch set as the listener (schema.find_candidates), including
+    # the age bound and excluding any response_deadline gate.
+    cfg = _load_config(args.config, log)
+    rows = _schema_mod().find_candidates(con, AGENT_PREFIX, time.time(),
+                                         cfg["max_age_seconds"])
     rc = 0
-    for (message_id,) in rows:
-        if not _auto_enabled(args.config, *_recipient_of(con, message_id), log):
+    for message_id, recipient, _created in rows:
+        if not cfg["auto"].get(recipient, False):
             log.info("recover: message %s recipient disabled by config", message_id)
             continue
         rc = max(rc, _process_message(con, message_id, args, log))
     log.info("recover finished: %d candidate(s)", len(rows))
     return rc
-
-
-def _recipient_of(con: sqlite3.Connection, message_id: int) -> tuple[str]:
-    row = con.execute(
-        "SELECT recipient FROM messages WHERE id = ?", (message_id,)
-    ).fetchone()
-    return (row[0] if row else "claude",)
 
 
 def main(argv: list[str] | None = None) -> int:

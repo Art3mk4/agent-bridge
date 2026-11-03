@@ -164,7 +164,7 @@ Start a new Kimi session from the project and trust the workspace if the MCP com
 7. sender:    mark_read([result_id])
 ```
 
-If the recipient cannot finish, it sends a `blocked: ...` result and releases the original message instead of acknowledging it. A response deadline is advisory metadata: Agent Bridge never auto-resends and never retries an attempted dispatch.
+If the recipient cannot finish, it sends a `blocked: ...` result and releases the original message instead of acknowledging it. A response deadline is advisory metadata: Agent Bridge never auto-resends and never retries an attempted dispatch, and a passed deadline does not stop a never-attempted message from being delivered.
 
 ## Bounded conversations
 
@@ -187,11 +187,16 @@ The default automation gate is:
   "auto": {
     "claude": true,
     "kimi": false
-  }
+  },
+  "dispatch_max_age_seconds": 86400
 }
 ```
 
 Claude-side headless execution is enabled by default in this configuration. Kimi-side headless execution remains disabled because Kimi CLI prompt mode applies its own automatic permission policy without interactive approvals; enable `auto.kimi` only as a deliberate local decision.
+
+`dispatch_max_age_seconds` (default 24 h) bounds automatic delivery by message **age**. A message that arrived while the listener was stopped, restarting or busy with another worker is still dispatched when it comes back, even if its `response_deadline` has passed — the deadline is metadata for the worker and the human. Only a backlog older than the bound is left alone: `listener.py pending` lists it and a manual `on_message.py <id>` runs one message on purpose.
+
+A malformed `config.json` automates nothing (fail closed).
 
 Useful commands:
 
@@ -199,19 +204,23 @@ Useful commands:
 uv run python systemd/listener.py status   --agent claude
 uv run python systemd/listener.py progress --agent claude --once
 uv run python systemd/listener.py watch    --agent claude
+uv run python systemd/listener.py pending  --agent claude
 uv run python systemd/listener.py disable  --agent claude
 uv run python systemd/listener.py enable   --agent claude
 ```
 
 `listener status` keeps the original machine-readable fields and additionally reports:
 
-- `stage`: `stopped`, `unknown`, `idle`, `received` or `supervising`;
+- `stage`: `stopped`, `starting`, `idle`, `received`, `supervising`, `legacy`, `unknown` or `error`;
+- `progress_state`: why a stage is not the ordinary one — `unreadable` (the progress file exists but cannot be parsed), `missing_file` (a live listener past the startup grace never wrote one: old code), `no_format_version` (its document predates the version marker), `stale_pid` (the document was written by a different process); null on the normal stages;
 - `progress`: the currently trusted lifecycle record;
 - `last`: the previous dispatch outcome, including duration and exit code where available.
 
+`listener pending` is a read-only backlog report: never-attempted messages that could wake a worker, split into `dispatchable` (the listener will take them) and `stale` (older than `dispatch_max_age_seconds`). It prints ids and ages only and never writes to the database.
+
 From an MCP session the same human-readable snapshot is one call: `listener(action="progress")` returns `{"line": ...}` — the exact string the cclocal status line renders, e.g. `[claude] idle | last msg#43 sender=kimi result=succeeded in 21.5s rc=0`. It is ids, enums and numbers only, never task payload, and the call never raises.
 
-Progress files live in `systemd/runtime/<agent>.progress.json` and contain ids, enums and numbers only. The runtime directory is private and gitignored.
+Progress files live in `systemd/runtime/<agent>.progress.json` and contain ids, enums and numbers only. Every document opens with `"format_version": 2`; a document without that marker comes from a listener written before the marker existed, and `status()` reports it as `legacy` instead of guessing its stage. The runtime directory is private and gitignored.
 
 ### Claude Code status line
 
@@ -271,13 +280,39 @@ The supervisor chooses a launcher by recipient:
 
 For public or team use, review these launchers and adapt them to your own client wrappers and permission model. Do not weaken static deny rules or hide permission requests.
 
+Workers run in the **workspace** directory — the project both CLIs open, where their project MCP configs live (`.mcp.json` for the Claude worker's `--strict-mcp-config`, `.kimi-code/mcp.json` for Kimi). By default it is the directory that *contains* this repository, which fits a layout like `~/project/agent-bridge`. If the clone lives elsewhere, set `AGENT_BRIDGE_WORKSPACE` in the `env` of both MCP registrations; the listener and its supervisors inherit it.
+
+If a launcher cannot be started at all (missing file, wrong permissions, bad workspace), the attempt is recorded as `failed` with `error_kind=spawn:<Error>`, the sender gets the usual payload-free notice and a conversation is frozen — the message is not left silently in `spawned`.
+
+## Headless worker permissions
+
+Claude-side workers start with `--permission-prompts none`: there is no human to approve anything, so every action that is not already allowed is denied automatically. A worker's effective permission set is rebuilt at process start from three sources:
+
+1. **User settings** from `CLAUDE_CONFIG_DIR` (`cclocal_headless.sh` sets it from the local wrapper env). In this deployment that file carries no `permissions` block at all.
+2. **Project settings** for the worker's cwd — `<workspace>/.claude/settings.local.json` (`--workspace` / `AGENT_BRIDGE_WORKSPACE`, see above). This file is the entire allowlist picture: both `permissions.allow` and `additionalDirectories`. MCP configuration is separate (`--mcp-config` + `--strict-mcp-config`) and grants nothing.
+3. **Sandbox auto-approval** for simple read-only commands (`ls`, `cat`, `grep`, …) whose paths stay inside the workspace and `additionalDirectories`. Everything else — arbitrary interpreters (`python3 -c`), script execution, writes, or any path outside those boundaries (even `ls -l` of a symlink that resolves into `~/.local/share/uv/…`) — requires approval and is therefore denied headless.
+
+Minimal sets per task type:
+
+- **Ordinary two-way task** (read code, answer over the bridge): the `mcp__agent_bridge__*` tools plus sandboxed read-only commands are enough. The worker must be able to finish either way — `result` or `blocked` — without writing anything.
+- **Engineering task** (edits in the repo): add file rules matching the target paths, plus explicit `Bash(...)` entries for every interpreter invocation the task uses (`uv run …`, `.venv/bin/python …`, `bash script.sh`) — the sandbox never auto-approves them. If those rules are absent, the dispatch ends `blocked` after burning the whole worker run; mark such tasks "interactive session" instead of dispatching them.
+
+Denial behavior:
+
+- **Compound commands die whole.** `allowed && denied`, `allowed; denied` or `allowed | denied` are denied as a unit — the allowed parts produce nothing. Probe suspect and safe commands in separate calls or you lose the data they could have given.
+- A denial is not fatal. After the first write denial an honest worker stops retrying, files a `blocked:` report and releases the claim (required by the dispatcher prompt); the supervisor classifies a self-filed blocker as an honest stop, not a dispatch error.
+
+Why an extended allowlist can appear to "not reach" the worker (TODO P1-11): the worker does read `<workspace>/.claude/settings.local.json` — proven by `additionalDirectories` taking effect in headless sessions and by `Bash` allow rules matching (`uv run python systemd/listener.py …` runs). What did not match were file rules written with single-slash absolute paths: `Edit(/home/<user>/project/**)`. `Edit`/`Read` rules use gitignore-style paths anchored to the settings file's directory, so a leading `/` anchors the pattern *inside* that directory and the rule matches nothing; absolute paths in these rules require the `//` prefix (`//home/<user>/project/**`), or write them relative to the settings directory (`Edit(agent_bridge/**)`). Workers 35 and 49, both started after the file was extended, were still denied `Edit`/`Write` under `agent_bridge/**` because of this, while `additionalDirectories` (which does accept real absolute paths) worked — the mixed effect is what looked like "the worker saw the old set". Confirmed live on 2026-11-03: a headless `Edit` of `agent_bridge/README.md` was denied with this rule in place; a positive test of the fixed rule form is still pending (one dispatch after the rule is rewritten).
+
 ## Reliability model
 
 - **One attempt barrier:** `dispatch_attempts.message_id` is the primary key. A rescan, restart or duplicate listener cannot launch the same message twice.
 - **No automatic retry:** crash, timeout or uncertainty remains visible for a human decision; a short operational notice is sent without task payload.
 - **Evidence-based success:** exit code 0 alone is not success. The protocol requires an acknowledged original plus the appropriate result, blocked report, follow-up or terminal conversation state.
 - **Lease and timeout:** worker claims expire; a worker timeout kills only that worker process group.
-- **Crash recovery:** stale attempts are reconciled by process evidence and report evidence. `--recover` examines only messages that have never been attempted.
+- **Delivery window:** never-attempted messages are dispatched regardless of `response_deadline`, within `dispatch_max_age_seconds`; older ones wait for a human.
+- **Crash recovery:** stale attempts are reconciled by process evidence and report evidence. A recorded worker pid only counts as alive when `/proc` shows that process started together with its attempt, so a recycled pid cannot pin an attempt in `spawned`. `--recover` examines only messages that have never been attempted and uses the same dispatch set as the listener.
+- **Concurrent start:** every process switches the database to WAL through the same retried recipe (`systemd/schema.py`), because on a not-yet-WAL file SQLite rejects the switch immediately while another writer holds a lock.
 - **Fresh database bootstrap:** the listener creates the dispatcher schema additively before scanning, so a new bridge database does not require a manual supervisor run.
 
 ## Security notes
@@ -285,7 +320,7 @@ For public or team use, review these launchers and adapt them to your own client
 - The bridge is local: MCP stdio, SQLite and local subprocesses.
 - Do not commit `bridge.db`, runtime files, outbox reports or agent MCP configuration.
 - Secrets are passed through environment variables or private files and are never written to the database, prompts, logs or progress files.
-- Logs are operational metadata only. Do not redirect MCP stderr into a file that also stores secret-bearing diagnostics.
+- Logs are operational metadata only and are created `0600` (`dispatcher.log` by both the listener and the supervisor, `errors.log` by the server). Do not redirect MCP stderr into a file that also stores secret-bearing diagnostics.
 - Claude-side workers may run with permission prompts disabled. Keep their allowlist minimal and prefer an explicit `blocked` response over any uncertain action.
 - Kimi-side automatic dispatch is deliberately gated off in the default configuration.
 - Conversations are not authorization to perform external or irreversible actions. Deployments, pushes, purchases and messages to third parties require a human decision.
@@ -300,11 +335,13 @@ uv run python systemd/test_dispatcher.py
 
 `test_bridge.py` is a destructive end-to-end test that deletes and recreates `bridge.db`. Run it only in a disposable copy of the project before live traffic, never against a database containing real messages.
 
-Current safe suite: 48 dispatcher tests.
+Current safe suite: 57 dispatcher tests, including a deterministic stress test for concurrent supervisors against a non-WAL database held by a writer.
+
+`systemd/schema.py` is the shared core of the dispatcher: DDL, the connection recipe, the `config.json` reader and the single definition of the dispatch set used by both the listener and `--recover`. Change dispatch rules there, not in the callers.
 
 ## Known limitations
 
-See [TODO.md](TODO.md). The main open item is a SQLite WAL startup race under concurrent supervisor launches; the ordinary suite can pass while a focused concurrent stress test still exposes it.
+See [TODO.md](TODO.md). The main open items are operational: minimal permissions for headless workers and visibility of `blocked` outcomes.
 
 ## License
 

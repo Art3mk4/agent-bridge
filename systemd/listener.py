@@ -54,6 +54,8 @@ CLI (emergency control without an MCP session):
                                                                 # human one-liner,
                                                                 # exit 0 always
     listener.py watch    --agent ... [--db --once]              # 1 s refresh
+    listener.py pending  --agent ... [--db --config]            # read-only
+                                                                # backlog JSON
 """
 
 from __future__ import annotations
@@ -81,7 +83,6 @@ DEFAULT_RUNTIME = HERE / "runtime"
 DEFAULT_ON_MESSAGE = HERE / "on_message.py"
 
 AGENTS = {"kimi", "claude"}
-DEFAULT_AUTO = {"claude": True, "kimi": False}
 
 POLL_SECONDS = 1.0
 SLEEP_SLICE = 0.2
@@ -96,6 +97,13 @@ LOG_MAX_BYTES = 1_000_000
 # like a dead listener. Failure here only defers the first dispatch.
 SCHEMA_RETRIES = 10
 PROGRESS_REFRESH_SECONDS = 1.0
+# A live pid with no progress file: inside this window after its start the
+# listener is still between the pidfile write and the tracker's first flush
+# ("starting"); past it, it is too old to write the file at all ("legacy").
+STARTING_GRACE_SECONDS = 60.0
+# Written first into every progress document; a document without it comes
+# from a listener that predates the marker, which status() calls "legacy".
+PROGRESS_FORMAT_VERSION = 2
 
 
 # ------------------------------------------------------------- runtime files
@@ -203,15 +211,14 @@ def _listener_pid(rt: Path, agent: str) -> int | None:
 # ------------------------------------------------------------------- gates
 
 def _config_enabled(config_path: str | Path, agent: str) -> bool:
-    # Same semantics as on_message: missing file -> defaults, malformed ->
-    # nothing automated (fail closed).
-    try:
-        cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
-        return bool(cfg.get("auto", DEFAULT_AUTO).get(agent, False))
-    except FileNotFoundError:
-        return DEFAULT_AUTO.get(agent, False)
-    except Exception:
-        return False
+    # One reader for listener and on_message (schema.load_dispatch_config):
+    # missing file -> defaults, malformed -> nothing automated (fail closed).
+    return _schema_mod().auto_enabled(config_path, agent)
+
+
+def _max_age(config_path: str | Path) -> float:
+    cfg, _err = _schema_mod().load_dispatch_config(config_path)
+    return cfg["max_age_seconds"]
 
 
 def _is_disabled(rt: Path, agent: str) -> bool:
@@ -261,12 +268,10 @@ def _ensure_schema(agent: str, db: str | Path, rt: Path) -> None:
         return
     con = None
     try:
-        con = sqlite3.connect(str(db), timeout=5.0)
-        con.execute("PRAGMA busy_timeout=5000")
-        had = con.execute("SELECT 1 FROM sqlite_master WHERE type='table'"
-                          " AND name='dispatch_attempts'").fetchone() is not None
-        if _schema_mod().ensure_dispatch_schema(con, retries=SCHEMA_RETRIES) \
-                and not had:
+        sm = _schema_mod()
+        con = sm.connect(db, wal=False)
+        had = sm.has_dispatch_table(con)
+        if sm.ensure_dispatch_schema(con, retries=SCHEMA_RETRIES) and not had:
             _log(rt, f"agent={agent} dispatch_attempts created")
     except Exception as exc:
         # Kind only: locked vs corrupt vs no-permission, without leaking paths.
@@ -283,12 +288,36 @@ def _progress_path(rt: Path, agent: str) -> Path:
     return rt / f"{agent}.progress.json"
 
 
-def _read_progress(rt: Path, agent: str) -> dict[str, Any] | None:
+def _load_progress(rt: Path, agent: str) -> tuple[dict[str, Any] | None, str]:
+    """The progress document and why it is not there: ("ok", doc),
+    ("missing", None), ("unreadable", None). The difference is the whole
+    point — a file that cannot be read is a fault, a file that is absent is
+    either a starting listener or an old one, and only status() holding the
+    live pid can say which."""
+    path = _progress_path(rt, agent)
     try:
-        doc = json.loads(_progress_path(rt, agent).read_text(encoding="utf-8"))
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None, "missing"
     except (OSError, ValueError):
-        return None
-    return doc if isinstance(doc, dict) else None
+        return None, "unreadable"
+    if not isinstance(doc, dict):
+        return None, "unreadable"
+    return doc, "ok"
+
+
+def _read_progress(rt: Path, agent: str) -> dict[str, Any] | None:
+    doc, state = _load_progress(rt, agent)
+    return doc if state == "ok" else None
+
+
+def _process_age_seconds(pid: int) -> float | None:
+    """How long the process has been alive, from /proc. None means
+    "unverifiable" and
+    every caller must read that as "not young". Parsing lives in
+    schema.proc_info, shared with the supervisor's pid check."""
+    info = _schema_mod().proc_info(pid)
+    return None if info is None else info[1]
 
 
 class _ProgressTracker:
@@ -310,7 +339,8 @@ class _ProgressTracker:
     def __init__(self, rt: Path, agent: str, pid: int):
         self.path = _progress_path(rt, agent)
         prev = _read_progress(rt, agent) or {}
-        self.doc: dict[str, Any] = {"listener_pid": pid, "updated_at": None,
+        self.doc: dict[str, Any] = {"format_version": PROGRESS_FORMAT_VERSION,
+                                    "listener_pid": pid, "updated_at": None,
                                     "current": None, "last": None}
         leftover = prev.get("current")
         if isinstance(leftover, dict) and leftover.get("message") is not None:
@@ -376,11 +406,10 @@ def _attempt_result(db: str | Path, mid: int) -> str | None:
     row is absent — the listener never recomputes an outcome, that is
     on_message.py's job."""
     try:
-        con = sqlite3.connect(str(db), timeout=5.0)
+        con = _schema_mod().connect(db, wal=False)
     except sqlite3.Error:
         return None
     try:
-        con.execute("PRAGMA busy_timeout=5000")
         row = con.execute("SELECT state FROM dispatch_attempts"
                           " WHERE message_id = ?", (mid,)).fetchone()
         return row[0] if row else None
@@ -402,16 +431,13 @@ def _senders_for(db: str | Path, ids: list[int]) -> dict[int, str]:
     """
     if not ids:
         return {}
-    p = Path(db)
-    if not p.exists():
-        return {}
     try:
-        con = sqlite3.connect(p.absolute().as_uri() + "?mode=ro", uri=True,
-                              timeout=1.0)
+        con = _schema_mod().connect_readonly(db)
     except (OSError, ValueError, sqlite3.Error):
         return {}
+    if con is None:
+        return {}
     try:
-        con.execute("PRAGMA busy_timeout=1000")
         marks = ",".join("?" * len(ids))
         rows = con.execute(
             f"SELECT id, sender FROM messages WHERE id IN ({marks})",
@@ -425,39 +451,11 @@ def _senders_for(db: str | Path, ids: list[int]) -> dict[int, str]:
 
 # ------------------------------------------------------------------ scanner
 
-_LEGACY_SCAN = (
-    "SELECT m.id FROM messages m"
-    " WHERE m.recipient = ? AND m.acknowledged = 0"
-    "   AND m.reply_to IS NULL"
-    "   AND m.response_deadline > ?"
-    "   AND (m.claim_expires_at IS NULL OR m.claim_expires_at <= ?)"
-    "   AND NOT EXISTS (SELECT 1 FROM dispatch_attempts a"
-    "                   WHERE a.message_id = m.id)"
-    " ORDER BY m.id LIMIT 1"
-)
-
-# Union of the two dispatch sets. (a) Legacy root tasks: pre-conversation
-# semantics, byte-for-byte — an autonomous conversation is never retroactive.
-# (b) Conversation messages: only 'task' and 'result' of a still-active,
-# unexpired conversation wake a worker; notices never do, and a message whose
-# conversation row is missing or malformed (kind NULL with a link, foreign id)
-# matches neither branch and never wakes anything. Parameters:
-# (agent, now, now, now). Exactly one candidate per scan keeps the one-worker
-# rule; the attempt PK still bars anything racing.
-_CONVERSATION_SCAN = (
-    "SELECT m.id FROM messages m"
-    " LEFT JOIN conversations c ON c.id = m.conversation_id"
-    " WHERE m.recipient = ? AND m.acknowledged = 0"
-    "   AND m.response_deadline > ?"
-    "   AND (m.claim_expires_at IS NULL OR m.claim_expires_at <= ?)"
-    "   AND ((m.conversation_id IS NULL AND m.kind IS NULL"
-    "         AND m.reply_to IS NULL)"
-    "        OR (m.conversation_id IS NOT NULL AND m.kind IN ('task','result')"
-    "            AND c.state = 'active' AND c.expires_at > ?))"
-    "   AND NOT EXISTS (SELECT 1 FROM dispatch_attempts a"
-    "                   WHERE a.message_id = m.id)"
-    " ORDER BY m.id LIMIT 1"
-)
+# The dispatch set itself (legacy root tasks + task/result of a live
+# conversation, bounded by message age, never by response_deadline) is
+# defined once in schema.find_candidates and shared with on_message --recover.
+# Exactly one candidate per scan keeps the one-worker rule; the attempt PK
+# still bars anything racing.
 
 
 def _expire_conversations(con: sqlite3.Connection, now: float) -> None:
@@ -485,31 +483,65 @@ def _expire_conversations(con: sqlite3.Connection, now: float) -> None:
     con.commit()
 
 
-def _scan(db: str | Path, agent: str) -> int | None:
+def _scan(db: str | Path, agent: str,
+          max_age: float | None = None) -> int | None:
+    sm = _schema_mod()
     now = time.time()
-    con = sqlite3.connect(str(db), timeout=5.0)
+    if max_age is None:
+        max_age = sm.DEFAULT_MAX_AGE_SECONDS
+    con = sm.connect(db, wal=False)
     try:
-        con.execute("PRAGMA busy_timeout=5000")
         # Guard, not the migration: run() already ensured the table, so
         # reaching here means the file is not a bridge database at all (or the
         # ensure was deferred by a lock). Reporting "nothing to do" beats an
         # OperationalError storm once a second against a foreign file.
-        if con.execute("SELECT 1 FROM sqlite_master WHERE type='table'"
-                       " AND name='dispatch_attempts'").fetchone() is None:
+        if not sm.has_dispatch_table(con):
             return None
         # Conversations exist only after the additive server.py migration;
-        # until then (and on hand-made legacy DBs) the old root-task rule
-        # applies unchanged. Expiry bookkeeping happens here because the
+        # until then (and on hand-made legacy DBs) find_candidates applies the
+        # old root-task rule. Expiry bookkeeping happens here because the
         # expired dialogue may never receive another write otherwise.
-        tables = {r[0] for r in con.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'")}
-        columns = {r[1] for r in con.execute("PRAGMA table_info(messages)")}
-        if "conversations" not in tables or "kind" not in columns:
-            row = con.execute(_LEGACY_SCAN, (agent, now, now)).fetchone()
-            return row[0] if row else None
-        _expire_conversations(con, now)
-        row = con.execute(_CONVERSATION_SCAN, (agent, now, now, now)).fetchone()
-        return row[0] if row else None
+        if sm.has_conversations(con):
+            _expire_conversations(con, now)
+        rows = sm.find_candidates(con, [agent], now, max_age, limit=1)
+        return rows[0][0] if rows else None
+    finally:
+        con.close()
+
+
+def pending(agent: str, config: str, db: str | Path) -> dict[str, Any]:
+    """Read-only backlog report for one agent: never-attempted messages that
+    could wake a worker, split into `dispatchable` (within
+    dispatch_max_age_seconds — the listener will take them) and `stale`
+    (older — a human decides; `on_message.py <id>` runs one by hand). Ids and
+    ages only, never payload; nothing is written or dispatched."""
+    sm = _schema_mod()
+    cfg, err = sm.load_dispatch_config(config)
+    out: dict[str, Any] = {
+        "agent": agent, "auto": bool(cfg["auto"].get(agent, False)),
+        "max_age_seconds": cfg["max_age_seconds"], "config_error": err,
+        "dispatchable": [], "stale": []}
+    try:
+        con = sm.connect_readonly(db, timeout=2.0)
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        out["error"] = type(exc).__name__
+        return out
+    if con is None:
+        out["error"] = "no_database"
+        return out
+    try:
+        if not sm.has_dispatch_table(con):
+            out["error"] = "no_dispatch_table"
+            return out
+        now = time.time()
+        for mid, _rcpt, created in sm.find_candidates(con, [agent], now, None):
+            age = round(now - created, 1)
+            key = "dispatchable" if age <= cfg["max_age_seconds"] else "stale"
+            out[key].append({"message": mid, "age_s": age})
+        return out
+    except sqlite3.Error as exc:
+        out["error"] = type(exc).__name__
+        return out
     finally:
         con.close()
 
@@ -613,7 +645,7 @@ def run(agent: str, db: str, config: str, runtime_dir: str,
                     break
                 continue
             try:
-                mid = _scan(db, agent)
+                mid = _scan(db, agent, _max_age(config))
                 fails = 0
             except sqlite3.Error as exc:
                 fails += 1
@@ -682,10 +714,18 @@ def status(agent: str, config: str, runtime_dir: str | Path) -> dict[str, Any]:
     untouched. stage/progress/last are additive:
 
       stage "stopped"  no listener whose pid /proc confirms,
-      stage "unknown"  a live listener too old to write progress.json,
+      stage "error"    the progress file exists but cannot be parsed,
+      stage "starting" live listener younger than STARTING_GRACE_SECONDS,
+                       still between the pidfile write and the first flush,
+      stage "legacy"   live listener too old to write (no file at all) or to
+                       mark its document with format_version,
+      stage "unknown"  a document from a foreign pid — current is not trusted,
+                       but `last` from it still is history worth showing,
       stage "idle"     it runs and has nothing in flight,
       otherwise        the stage in flight: received | supervising.
 
+    `progress_state` is an additive diagnostic — null on the normal stages
+    and otherwise unreadable | missing_file | no_format_version | stale_pid.
     `progress` is that in-flight stage (only when trusted), `last` is the
     outcome of the previous dispatch and is shown even for a dead listener —
     history is the one thing worth reading after a crash.
@@ -703,17 +743,30 @@ def status(agent: str, config: str, runtime_dir: str | Path) -> dict[str, Any]:
                 message = int(st.split(":", 1)[1])
             except ValueError:
                 message = None
-    raw = _read_progress(rt, agent)
-    prog = _trust_progress(raw, pid)
-    current = prog.get("current") if prog else None
+    raw, pstate = _load_progress(rt, agent)
+    progress_state: str | None = None
+    current: Any = None
     if pid is None:
         stage = "stopped"
-    elif prog is None:
-        stage = "unknown"
-    elif not isinstance(current, dict):
-        stage = "idle"
+    elif pstate == "unreadable":
+        stage, progress_state = "error", "unreadable"
+    elif pstate == "missing":
+        age = _process_age_seconds(pid)
+        if age is not None and age <= STARTING_GRACE_SECONDS:
+            stage = "starting"
+        else:
+            stage, progress_state = "legacy", "missing_file"
+    elif _trust_progress(raw, pid) is None:
+        # Foreign or recycled pid wrote this document; its `current` describes
+        # somebody else's listener, but its `last` is still the dispatch that
+        # agent most recently ran, which is exactly what a reader wants.
+        stage, progress_state = "unknown", "stale_pid"
+    elif raw.get("format_version") != PROGRESS_FORMAT_VERSION:
+        stage, progress_state = "legacy", "no_format_version"
     else:
-        stage = str(current.get("stage") or "unknown")
+        current = raw.get("current")
+        stage = "idle" if not isinstance(current, dict) else str(
+            current.get("stage") or "unknown")
     return {
         "agent": agent,
         "enabled": not _is_disabled(rt, agent),
@@ -722,6 +775,7 @@ def status(agent: str, config: str, runtime_dir: str | Path) -> dict[str, Any]:
         "message": message,
         "auto": _config_enabled(config, agent),
         "stage": stage,
+        "progress_state": progress_state,
         "progress": current if isinstance(current, dict) else None,
         "last": (raw or {}).get("last"),
     }
@@ -852,7 +906,7 @@ def disable(agent: str, config: str, runtime_dir: str) -> dict[str, Any]:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("action", choices=["run", "status", "enable", "disable",
-                                      "progress", "watch"])
+                                      "progress", "watch", "pending"])
     p.add_argument("--agent", required=True, choices=sorted(AGENTS))
     p.add_argument("--db", default=str(DEFAULT_DB))
     p.add_argument("--config", default=str(DEFAULT_CONFIG))
@@ -896,6 +950,9 @@ def main(argv: list[str] | None = None) -> int:
                 time.sleep(PROGRESS_REFRESH_SECONDS)
         except KeyboardInterrupt:
             pass
+    elif a.action == "pending":
+        print(json.dumps(pending(a.agent, a.config, a.db), ensure_ascii=False),
+              flush=True)
     elif a.action == "enable":
         print(json.dumps(enable(a.agent, a.db, a.config, rt, a.on_message),
                          ensure_ascii=False), flush=True)
