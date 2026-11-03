@@ -211,7 +211,8 @@ uv run python systemd/listener.py enable   --agent claude
 
 `listener status` keeps the original machine-readable fields and additionally reports:
 
-- `stage`: `stopped`, `unknown`, `idle`, `received` or `supervising`;
+- `stage`: `stopped`, `starting`, `idle`, `received`, `supervising`, `legacy`, `unknown` or `error`;
+- `progress_state`: why a stage is not the ordinary one — `unreadable` (the progress file exists but cannot be parsed), `missing_file` (a live listener past the startup grace never wrote one: old code), `no_format_version` (its document predates the version marker), `stale_pid` (the document was written by a different process); null on the normal stages;
 - `progress`: the currently trusted lifecycle record;
 - `last`: the previous dispatch outcome, including duration and exit code where available.
 
@@ -219,7 +220,7 @@ uv run python systemd/listener.py enable   --agent claude
 
 From an MCP session the same human-readable snapshot is one call: `listener(action="progress")` returns `{"line": ...}` — the exact string the cclocal status line renders, e.g. `[claude] idle | last msg#43 sender=kimi result=succeeded in 21.5s rc=0`. It is ids, enums and numbers only, never task payload, and the call never raises.
 
-Progress files live in `systemd/runtime/<agent>.progress.json` and contain ids, enums and numbers only. The runtime directory is private and gitignored.
+Progress files live in `systemd/runtime/<agent>.progress.json` and contain ids, enums and numbers only. Every document opens with `"format_version": 2`; a document without that marker comes from a listener written before the marker existed, and `status()` reports it as `legacy` instead of guessing its stage. The runtime directory is private and gitignored.
 
 ### Claude Code status line
 
@@ -283,6 +284,26 @@ Workers run in the **workspace** directory — the project both CLIs open, where
 
 If a launcher cannot be started at all (missing file, wrong permissions, bad workspace), the attempt is recorded as `failed` with `error_kind=spawn:<Error>`, the sender gets the usual payload-free notice and a conversation is frozen — the message is not left silently in `spawned`.
 
+## Headless worker permissions
+
+Claude-side workers start with `--permission-prompts none`: there is no human to approve anything, so every action that is not already allowed is denied automatically. A worker's effective permission set is rebuilt at process start from three sources:
+
+1. **User settings** from `CLAUDE_CONFIG_DIR` (`cclocal_headless.sh` sets it from the local wrapper env). In this deployment that file carries no `permissions` block at all.
+2. **Project settings** for the worker's cwd — `<workspace>/.claude/settings.local.json` (`--workspace` / `AGENT_BRIDGE_WORKSPACE`, see above). This file is the entire allowlist picture: both `permissions.allow` and `additionalDirectories`. MCP configuration is separate (`--mcp-config` + `--strict-mcp-config`) and grants nothing.
+3. **Sandbox auto-approval** for simple read-only commands (`ls`, `cat`, `grep`, …) whose paths stay inside the workspace and `additionalDirectories`. Everything else — arbitrary interpreters (`python3 -c`), script execution, writes, or any path outside those boundaries (even `ls -l` of a symlink that resolves into `~/.local/share/uv/…`) — requires approval and is therefore denied headless.
+
+Minimal sets per task type:
+
+- **Ordinary two-way task** (read code, answer over the bridge): the `mcp__agent_bridge__*` tools plus sandboxed read-only commands are enough. The worker must be able to finish either way — `result` or `blocked` — without writing anything.
+- **Engineering task** (edits in the repo): add file rules matching the target paths, plus explicit `Bash(...)` entries for every interpreter invocation the task uses (`uv run …`, `.venv/bin/python …`, `bash script.sh`) — the sandbox never auto-approves them. If those rules are absent, the dispatch ends `blocked` after burning the whole worker run; mark such tasks "interactive session" instead of dispatching them.
+
+Denial behavior:
+
+- **Compound commands die whole.** `allowed && denied`, `allowed; denied` or `allowed | denied` are denied as a unit — the allowed parts produce nothing. Probe suspect and safe commands in separate calls or you lose the data they could have given.
+- A denial is not fatal. After the first write denial an honest worker stops retrying, files a `blocked:` report and releases the claim (required by the dispatcher prompt); the supervisor classifies a self-filed blocker as an honest stop, not a dispatch error.
+
+Why an extended allowlist can appear to "not reach" the worker (TODO P1-11): the worker does read `<workspace>/.claude/settings.local.json` — proven by `additionalDirectories` taking effect in headless sessions and by `Bash` allow rules matching (`uv run python systemd/listener.py …` runs). What did not match were file rules written with single-slash absolute paths: `Edit(/home/<user>/project/**)`. `Edit`/`Read` rules use gitignore-style paths anchored to the settings file's directory, so a leading `/` anchors the pattern *inside* that directory and the rule matches nothing; absolute paths in these rules require the `//` prefix (`//home/<user>/project/**`), or write them relative to the settings directory (`Edit(agent_bridge/**)`). Workers 35 and 49, both started after the file was extended, were still denied `Edit`/`Write` under `agent_bridge/**` because of this, while `additionalDirectories` (which does accept real absolute paths) worked — the mixed effect is what looked like "the worker saw the old set". Confirmed live on 2026-11-03: a headless `Edit` of `agent_bridge/README.md` was denied with this rule in place; a positive test of the fixed rule form is still pending (one dispatch after the rule is rewritten).
+
 ## Reliability model
 
 - **One attempt barrier:** `dispatch_attempts.message_id` is the primary key. A rescan, restart or duplicate listener cannot launch the same message twice.
@@ -314,7 +335,7 @@ uv run python systemd/test_dispatcher.py
 
 `test_bridge.py` is a destructive end-to-end test that deletes and recreates `bridge.db`. Run it only in a disposable copy of the project before live traffic, never against a database containing real messages.
 
-Current safe suite: 56 dispatcher tests, including a deterministic stress test for concurrent supervisors against a non-WAL database held by a writer.
+Current safe suite: 57 dispatcher tests, including a deterministic stress test for concurrent supervisors against a non-WAL database held by a writer.
 
 `systemd/schema.py` is the shared core of the dispatcher: DDL, the connection recipe, the `config.json` reader and the single definition of the dispatch set used by both the listener and `--recover`. Change dispatch rules there, not in the callers.
 

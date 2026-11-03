@@ -2224,16 +2224,18 @@ def test_46_progress_terminal_and_stale_recovery(d: Path):
 
 
 def test_47_status_backcompat_without_progress_file(d: Path):
-    # A listener still running OLD code: /proc proves its pid, but it never
-    # writes progress.json. status() keeps every legacy key intact and answers
-    # 'unknown' — honest invisibility — instead of inventing a stage.
+    # A live listener whose progress.json is not there yet: /proc proves its
+    # pid, the file is absent. P0-3 split the old blanket 'unknown' here — a
+    # process younger than STARTING_GRACE_SECONDS is in its startup window
+    # ('starting'), and status() still keeps every pre-progress key intact
+    # and invents no stage either way.
     db = new_db(d)
     cfg = write_cfg(d)
     rt = d / "runtime"
     rt.mkdir(parents=True, exist_ok=True)
     # 'watch' is a real listener.py invocation that _listener_pid() accepts
-    # but that never dispatches and never writes progress: the stand-in for a
-    # listener built before this feature existed.
+    # but that never dispatches and never writes progress: the stand-in for
+    # a listener between the pidfile write and the tracker's first flush.
     w = subprocess.Popen(listener_cmd("watch", "claude", rt, cfg=cfg),
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, env=listener_env())
@@ -2245,12 +2247,14 @@ def test_47_status_backcompat_without_progress_file(d: Path):
               st["agent"] == "claude" and st["enabled"] is True
               and st["running"] is True and st["pid"] == w.pid
               and st["message"] == 999 and st["auto"] is True, str(st))
-        check("no invented stage", st["stage"] == "unknown", str(st))
+        check("young listener without a file is 'starting'",
+              st["stage"] == "starting" and st["progress_state"] is None,
+              str(st))
         check("progress hidden when absent", st["progress"] is None)
         check("no history yet", st["last"] is None)
         pv = listener_cli("progress", "claude", rt, db=db, cfg=cfg)
         check("progress CLI works without a progress file",
-              pv.returncode == 0 and "[claude] unknown msg#999" in pv.stdout,
+              pv.returncode == 0 and "[claude] starting msg#999" in pv.stdout,
               pv.stdout)
         check("no sender invented for an id the database does not know",
               "sender=" not in pv.stdout, pv.stdout)
@@ -2285,6 +2289,8 @@ def test_48_progress_and_status_no_payload(d: Path):
         doc = (rt / "claude.progress.json").read_text(errors="replace")
         check("progress file free of payload", SENTINEL not in doc,
               doc[-300:])
+        check("progress document carries the format marker",
+              json.loads(doc).get("format_version") == 2, doc[:200])
         log = (rt / "dispatcher.log").read_text(errors="replace") \
             if (rt / "dispatcher.log").exists() else ""
         check("dispatcher log free of payload", SENTINEL not in log)
@@ -2438,7 +2444,7 @@ def test_52_progress_line_history_and_robust(d: Path):
             pv = listener_cli("progress", "claude", rt, db=typo, cfg=cfg)
             check("mistyped --db: rc0, id kept, no sender",
                   pv.returncode == 0
-                  and pv.stdout.strip() == "[claude] unknown msg#999",
+                  and pv.stdout.strip() == "[claude] starting msg#999",
                   f"rc={pv.returncode} out={pv.stdout!r}")
             check("mistyped --db creates no stray database",
                   not typo.exists())
@@ -2447,14 +2453,14 @@ def test_52_progress_line_history_and_robust(d: Path):
             pv = listener_cli("progress", "claude", rt, db=junk, cfg=cfg)
             check("corrupt database: rc0, sender degrades away",
                   pv.returncode == 0
-                  and pv.stdout.strip() == "[claude] unknown msg#999",
+                  and pv.stdout.strip() == "[claude] starting msg#999",
                   f"rc={pv.returncode} out={pv.stdout!r}")
             (rt / "claude.progress.json").write_text("garbage {{{",
                                                      encoding="utf-8")
             pv = listener_cli("progress", "claude", rt, db=db, cfg=cfg)
-            check("junk progress.json: rc0, honest unknown",
+            check("junk progress.json: rc0, honest error",
                   pv.returncode == 0
-                  and pv.stdout.strip() == "[claude] unknown msg#999",
+                  and pv.stdout.strip() == "[claude] error msg#999",
                   f"rc={pv.returncode} out={pv.stdout!r}")
             bad_cfg = d / "bad-config.json"
             bad_cfg.write_text("{oops", encoding="utf-8")
@@ -2462,7 +2468,7 @@ def test_52_progress_line_history_and_robust(d: Path):
             check("malformed config: rc0 and fail-closed suffix",
                   pv.returncode == 0
                   and pv.stdout.strip()
-                  == "[claude] unknown msg#999 (auto off)",
+                  == "[claude] error msg#999 (auto off)",
                   f"rc={pv.returncode} out={pv.stdout!r}")
         finally:
             w.terminate()
@@ -2492,7 +2498,8 @@ def test_53_progress_line_speed(d: Path):
     try:
         (rt / "claude.listener.pid").write_text(f"{w.pid}\n")
         (rt / "claude.progress.json").write_text(json.dumps({
-            "listener_pid": w.pid, "updated_at": time.time(),
+            "format_version": 2, "listener_pid": w.pid,
+            "updated_at": time.time(),
             "current": {"message": mid, "stage": "supervising",
                         "supervisor_pid": w.pid + 1, "since": time.time()},
             "last": None}), encoding="utf-8")
@@ -2780,6 +2787,99 @@ def test_62_server_init_lock_raises_runtimeerror(d: Path):
         server._connect, server.time = orig_connect, orig_time
 
 
+def test_63_status_stage_causes(d: Path):
+    # P0-3: the causes the old blanket 'unknown' collapsed are now each named.
+    # status() runs in-process against the real module (the stand-in must be a
+    # real listener.py process for _listener_pid's /proc check; the young
+    # process keeps the 'starting' window honest), and each branch is driven
+    # by writing nothing but runtime files.
+    db = new_db(d)
+    cfg = write_cfg(d)
+    rt = d / "runtime"
+    rt.mkdir(parents=True, exist_ok=True)
+    server = import_server(d / "server_errors.log")
+    os.environ["AGENT_ID"] = "claude"
+    mod = server._get_listener()
+    w = subprocess.Popen(listener_cmd("watch", "claude", rt, cfg=cfg),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, env=listener_env())
+    prog = rt / "claude.progress.json"
+    try:
+        (rt / "claude.listener.pid").write_text(f"{w.pid}\n")
+        st = mod.status("claude", str(cfg), rt)
+        check("no file + young process -> starting",
+              st["stage"] == "starting" and st["progress_state"] is None,
+              str(st))
+        old_grace = mod.STARTING_GRACE_SECONDS
+        mod.STARTING_GRACE_SECONDS = -1.0
+        try:
+            st = mod.status("claude", str(cfg), rt)
+            check("no file + process past the grace -> legacy/missing_file",
+                  st["stage"] == "legacy"
+                  and st["progress_state"] == "missing_file", str(st))
+        finally:
+            mod.STARTING_GRACE_SECONDS = old_grace
+        prog.write_text(json.dumps({
+            "listener_pid": w.pid, "updated_at": time.time(),
+            "current": None, "last": None}), encoding="utf-8")
+        st = mod.status("claude", str(cfg), rt)
+        check("document without the marker -> legacy/no_format_version",
+              st["stage"] == "legacy"
+              and st["progress_state"] == "no_format_version", str(st))
+        # A foreign pid must win over the marker check: an old listener's
+        # unmarked document left under a recycled pid says nothing about
+        # anybody, while its `last` is still real history for this agent.
+        prog.write_text(json.dumps({
+            "listener_pid": w.pid + 4242, "updated_at": time.time(),
+            "current": {"message": 123, "stage": "supervising",
+                        "supervisor_pid": 1, "since": time.time()},
+            "last": {"message": 42, "stage": "finished",
+                     "result": "succeeded", "supervisor_rc": 0,
+                     "duration_s": 1.0}}), encoding="utf-8")
+        st = mod.status("claude", str(cfg), rt)
+        check("foreign pid checked before the marker -> unknown/stale_pid",
+              st["stage"] == "unknown"
+              and st["progress_state"] == "stale_pid", str(st))
+        check("untrusted current stays hidden", st["progress"] is None,
+              str(st))
+        check("stale document still tells the true history",
+              (st["last"] or {}).get("message") == 42, str(st["last"]))
+        prog.write_text("garbage {{{", encoding="utf-8")
+        st = mod.status("claude", str(cfg), rt)
+        check("unreadable document -> error/unreadable",
+              st["stage"] == "error"
+              and st["progress_state"] == "unreadable", str(st))
+        prog.write_text(json.dumps({
+            "format_version": 2, "listener_pid": w.pid,
+            "updated_at": time.time(),
+            "current": {"message": 55, "stage": "supervising",
+                        "supervisor_pid": w.pid + 1, "since": time.time()},
+            "last": None}), encoding="utf-8")
+        st = mod.status("claude", str(cfg), rt)
+        check("trusted marked document reports its own stage",
+              st["stage"] == "supervising" and st["progress_state"] is None
+              and (st["progress"] or {}).get("message") == 55, str(st))
+        # The new stage words also reach the compact statusline surface.
+        prog.write_text("garbage {{{", encoding="utf-8")
+        pv = listener_cli("progress", "claude", rt, db=db, cfg=cfg)
+        check("compact line renders 'error'",
+              pv.returncode == 0 and pv.stdout.strip() == "[claude] error",
+              f"rc={pv.returncode} out={pv.stdout!r}")
+        prog.write_text(json.dumps({
+            "listener_pid": w.pid, "updated_at": time.time(),
+            "current": None, "last": None}), encoding="utf-8")
+        pv = listener_cli("progress", "claude", rt, db=db, cfg=cfg)
+        check("compact line renders 'legacy'",
+              pv.returncode == 0 and pv.stdout.strip() == "[claude] legacy",
+              f"rc={pv.returncode} out={pv.stdout!r}")
+    finally:
+        w.terminate()
+        try:
+            w.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            w.kill()
+
+
 # ------------------------------------------------------------------- main
 
 def main() -> int:
@@ -2841,6 +2941,7 @@ def main() -> int:
         test_60_pending_report,
         test_61_config_reader_and_workspace,
         test_62_server_init_lock_raises_runtimeerror,
+        test_63_status_stage_causes,
     ]
     try:
         for fn in tests:

@@ -97,6 +97,13 @@ LOG_MAX_BYTES = 1_000_000
 # like a dead listener. Failure here only defers the first dispatch.
 SCHEMA_RETRIES = 10
 PROGRESS_REFRESH_SECONDS = 1.0
+# A live pid with no progress file: inside this window after its start the
+# listener is still between the pidfile write and the tracker's first flush
+# ("starting"); past it, it is too old to write the file at all ("legacy").
+STARTING_GRACE_SECONDS = 60.0
+# Written first into every progress document; a document without it comes
+# from a listener that predates the marker, which status() calls "legacy".
+PROGRESS_FORMAT_VERSION = 2
 
 
 # ------------------------------------------------------------- runtime files
@@ -281,12 +288,36 @@ def _progress_path(rt: Path, agent: str) -> Path:
     return rt / f"{agent}.progress.json"
 
 
-def _read_progress(rt: Path, agent: str) -> dict[str, Any] | None:
+def _load_progress(rt: Path, agent: str) -> tuple[dict[str, Any] | None, str]:
+    """The progress document and why it is not there: ("ok", doc),
+    ("missing", None), ("unreadable", None). The difference is the whole
+    point — a file that cannot be read is a fault, a file that is absent is
+    either a starting listener or an old one, and only status() holding the
+    live pid can say which."""
+    path = _progress_path(rt, agent)
     try:
-        doc = json.loads(_progress_path(rt, agent).read_text(encoding="utf-8"))
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None, "missing"
     except (OSError, ValueError):
-        return None
-    return doc if isinstance(doc, dict) else None
+        return None, "unreadable"
+    if not isinstance(doc, dict):
+        return None, "unreadable"
+    return doc, "ok"
+
+
+def _read_progress(rt: Path, agent: str) -> dict[str, Any] | None:
+    doc, state = _load_progress(rt, agent)
+    return doc if state == "ok" else None
+
+
+def _process_age_seconds(pid: int) -> float | None:
+    """How long the process has been alive, from /proc. None means
+    "unverifiable" and
+    every caller must read that as "not young". Parsing lives in
+    schema.proc_info, shared with the supervisor's pid check."""
+    info = _schema_mod().proc_info(pid)
+    return None if info is None else info[1]
 
 
 class _ProgressTracker:
@@ -308,7 +339,8 @@ class _ProgressTracker:
     def __init__(self, rt: Path, agent: str, pid: int):
         self.path = _progress_path(rt, agent)
         prev = _read_progress(rt, agent) or {}
-        self.doc: dict[str, Any] = {"listener_pid": pid, "updated_at": None,
+        self.doc: dict[str, Any] = {"format_version": PROGRESS_FORMAT_VERSION,
+                                    "listener_pid": pid, "updated_at": None,
                                     "current": None, "last": None}
         leftover = prev.get("current")
         if isinstance(leftover, dict) and leftover.get("message") is not None:
@@ -682,10 +714,18 @@ def status(agent: str, config: str, runtime_dir: str | Path) -> dict[str, Any]:
     untouched. stage/progress/last are additive:
 
       stage "stopped"  no listener whose pid /proc confirms,
-      stage "unknown"  a live listener too old to write progress.json,
+      stage "error"    the progress file exists but cannot be parsed,
+      stage "starting" live listener younger than STARTING_GRACE_SECONDS,
+                       still between the pidfile write and the first flush,
+      stage "legacy"   live listener too old to write (no file at all) or to
+                       mark its document with format_version,
+      stage "unknown"  a document from a foreign pid — current is not trusted,
+                       but `last` from it still is history worth showing,
       stage "idle"     it runs and has nothing in flight,
       otherwise        the stage in flight: received | supervising.
 
+    `progress_state` is an additive diagnostic — null on the normal stages
+    and otherwise unreadable | missing_file | no_format_version | stale_pid.
     `progress` is that in-flight stage (only when trusted), `last` is the
     outcome of the previous dispatch and is shown even for a dead listener —
     history is the one thing worth reading after a crash.
@@ -703,17 +743,30 @@ def status(agent: str, config: str, runtime_dir: str | Path) -> dict[str, Any]:
                 message = int(st.split(":", 1)[1])
             except ValueError:
                 message = None
-    raw = _read_progress(rt, agent)
-    prog = _trust_progress(raw, pid)
-    current = prog.get("current") if prog else None
+    raw, pstate = _load_progress(rt, agent)
+    progress_state: str | None = None
+    current: Any = None
     if pid is None:
         stage = "stopped"
-    elif prog is None:
-        stage = "unknown"
-    elif not isinstance(current, dict):
-        stage = "idle"
+    elif pstate == "unreadable":
+        stage, progress_state = "error", "unreadable"
+    elif pstate == "missing":
+        age = _process_age_seconds(pid)
+        if age is not None and age <= STARTING_GRACE_SECONDS:
+            stage = "starting"
+        else:
+            stage, progress_state = "legacy", "missing_file"
+    elif _trust_progress(raw, pid) is None:
+        # Foreign or recycled pid wrote this document; its `current` describes
+        # somebody else's listener, but its `last` is still the dispatch that
+        # agent most recently ran, which is exactly what a reader wants.
+        stage, progress_state = "unknown", "stale_pid"
+    elif raw.get("format_version") != PROGRESS_FORMAT_VERSION:
+        stage, progress_state = "legacy", "no_format_version"
     else:
-        stage = str(current.get("stage") or "unknown")
+        current = raw.get("current")
+        stage = "idle" if not isinstance(current, dict) else str(
+            current.get("stage") or "unknown")
     return {
         "agent": agent,
         "enabled": not _is_disabled(rt, agent),
@@ -722,6 +775,7 @@ def status(agent: str, config: str, runtime_dir: str | Path) -> dict[str, Any]:
         "message": message,
         "auto": _config_enabled(config, agent),
         "stage": stage,
+        "progress_state": progress_state,
         "progress": current if isinstance(current, dict) else None,
         "last": (raw or {}).get("last"),
     }

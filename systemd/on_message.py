@@ -760,18 +760,13 @@ def _notify_sender(con: sqlite3.Connection, row: tuple, state: str,
 
 def _proc_start(pid: int) -> tuple[str, float] | None:
     """(state letter, start time as epoch seconds) from /proc, or None when
-    /proc cannot say (no procfs, process gone, unparsable)."""
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
-        # comm may contain spaces and parentheses: split after the LAST ')'.
-        fields = stat[stat.rindex(")") + 2:].split()
-        state, start_ticks = fields[0], int(fields[19])
-        btime = next(int(line.split()[1]) for line in
-                     Path("/proc/stat").read_text().splitlines()
-                     if line.startswith("btime "))
-        return state, btime + start_ticks / os.sysconf("SC_CLK_TCK")
-    except (OSError, ValueError, IndexError, StopIteration):
+    /proc cannot say. Parsing lives in schema.proc_info (shared with the
+    listener); the start is derived from the process age."""
+    info = _schema_mod().proc_info(pid)
+    if info is None:
         return None
+    state, age = info
+    return state, time.time() - age
 
 
 def _pid_alive(pid: int | None, started_at: float | None = None) -> bool:

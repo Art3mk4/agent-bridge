@@ -267,6 +267,29 @@ def find_candidates(con: sqlite3.Connection, agents: Iterable[str],
             for r in con.execute(sql, params).fetchall()]
 
 
+# ---------------------------------------------------------------- processes
+
+def proc_info(pid: int) -> tuple[str, float] | None:
+    """(state letter, age in seconds) of a process from /proc, or None when
+    /proc cannot say (no procfs, process gone, unparsable). Shared by the
+    listener ("is this listener still starting?") and the supervisor ("is
+    this live pid really the worker of that attempt?").
+
+    Field 22 of /proc/<pid>/stat is the start time in clock ticks since boot;
+    comm may contain spaces and parentheses, so the line is cut at the LAST
+    ')'. Age is measured against /proc/uptime, not the wall clock, so a clock
+    jump cannot make a process look younger or older than it is."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        fields = raw.rsplit(")", 1)[1].split()
+        state, start_ticks = fields[0], float(fields[19])
+        uptime = float(Path("/proc/uptime").read_text(encoding="utf-8")
+                       .split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    return state, max(0.0, uptime - start_ticks / os.sysconf("SC_CLK_TCK"))
+
+
 # ------------------------------------------------------------------ logging
 
 class PrivateFileHandler(logging.FileHandler):
