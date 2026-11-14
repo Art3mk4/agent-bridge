@@ -5,7 +5,7 @@
       "args": [
         "run",
         "--directory",
-        "/home/art3mk4/development/vibe_coding/agent_bridge",
+        "${AGENT_BRIDGE_DIR}",
         "python",
         "server.py"
       ],

@@ -14,6 +14,13 @@
 #   OCLOCAL_OPENCLAUDE_BIN openclaude executable (default: openclaude from PATH)
 set -euo pipefail
 
+# AGENT_BRIDGE_DIR: systemd/mcp.local.json references the bridge directory as
+# "${AGENT_BRIDGE_DIR}" — OpenClaude expands it against this launcher's env.
+# Derived from the script's own location, so the repo layout is never baked
+# in and any clone location works without edits.
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+export AGENT_BRIDGE_DIR="${AGENT_BRIDGE_DIR:-$(cd "$HERE/.." && pwd)}"
+
 ENV_FILE="${OCLOCAL_ENV_FILE:-$HOME/.bash_aliases}"
 OPENCLAUDE_BIN="${OCLOCAL_OPENCLAUDE_BIN:-openclaude}"
 

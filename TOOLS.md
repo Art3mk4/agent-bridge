@@ -198,6 +198,7 @@ on_message.py [message_id] [--recover] [--auto]
 - `.mcp.json` (проектный, gitignored) — регистрация MCP-сервера: `uv run --directory <bridge> python server.py` + env `AGENT_ID`.
 - `AGENT_ID` ∈ `{claude, kimi, local}` — личность процесса; без него инструменты отказывают.
 - `AGENT_BRIDGE_AUTO_LISTEN=0` — запрет autostart listener'а при загрузке MCP (на явный `enable` не влияет).
+- `AGENT_BRIDGE_DIR` — каталог моста (где `server.py`); подставляется в `systemd/mcp.local.json` как `${AGENT_BRIDGE_DIR}` — OpenClaude раскрывает переменные в `command`/`args`/`env` на своей стороне, дефолта нет, при отсутствии переменной подключение падает с явной ошибкой. `oclocal_headless.sh` экспортирует её сам (по своему месту в репо); интерактивный запуск требует export заранее.
 - Statusline (опционально, только интерактивные сессии cclocal): `~/.claude-local/statusline-agent-bridge.sh` → `listener.py progress --agent claude --once`, `refreshInterval=2`. Настраивается вручную, bridge сам глобальные настройки не трогает.
 
 ## 8. Тесты
