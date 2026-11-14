@@ -82,7 +82,7 @@ DEFAULT_CONFIG = HERE / "config.json"
 DEFAULT_RUNTIME = HERE / "runtime"
 DEFAULT_ON_MESSAGE = HERE / "on_message.py"
 
-AGENTS = {"kimi", "claude"}
+AGENTS = {"kimi", "claude", "local"}
 
 POLL_SECONDS = 1.0
 SLEEP_SLICE = 0.2
