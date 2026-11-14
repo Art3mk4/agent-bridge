@@ -2722,7 +2722,8 @@ def test_60_pending_report(d: Path):
 def test_61_config_reader_and_workspace(d: Path):
     sm = _load_schema_mod()
     cfg, err = sm.load_dispatch_config(d / "absent.json")
-    check("missing -> defaults", cfg["auto"] == {"claude": True, "kimi": False}
+    check("missing -> defaults", cfg["auto"] == {"claude": True, "kimi": False,
+                                                 "local": True}
           and cfg["max_age_seconds"] == 86400.0 and err is None, str(cfg))
     bad = d / "bad.json"
     bad.write_text("{not json", encoding="utf-8")
@@ -2739,7 +2740,8 @@ def test_61_config_reader_and_workspace(d: Path):
           sm.load_dispatch_config(neg)[0]["max_age_seconds"] == 86400.0)
     ok = write_cfg(new_area("t61ok"), kimi=True, max_age=90)
     cfg, err = sm.load_dispatch_config(ok)
-    check("valid config read", cfg["auto"] == {"claude": True, "kimi": True}
+    check("valid config read", cfg["auto"] == {"claude": True, "kimi": True,
+                                               "local": False}
           and cfg["max_age_seconds"] == 90.0 and err is None, str(cfg))
     # AGENT_BRIDGE_WORKSPACE moves the worker cwd for clones that do not
     # live inside the project directory.

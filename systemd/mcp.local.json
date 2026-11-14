@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "agent_bridge": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/home/art3mk4/development/vibe_coding/agent_bridge",
+        "python",
+        "server.py"
+      ],
+      "env": {
+        "AGENT_ID": "local"
+      }
+    }
+  }
+}

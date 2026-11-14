@@ -47,8 +47,8 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-AGENTS = ("claude", "kimi")
-DEFAULT_AUTO = {"claude": True, "kimi": False}
+AGENTS = ("claude", "kimi", "local")
+DEFAULT_AUTO = {"claude": True, "kimi": False, "local": True}
 DEFAULT_MAX_AGE_SECONDS = 86400.0
 BUSY_TIMEOUT_MS = 5000
 

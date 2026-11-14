@@ -68,10 +68,11 @@ ROOT = HERE.parent                            # agent_bridge
 WORKSPACE = Path(os.path.expanduser(
     os.environ.get("AGENT_BRIDGE_WORKSPACE") or str(ROOT.parent))).resolve()
 
-AGENT_PREFIX = {"claude": "cclocal", "kimi": "kimi"}
+AGENT_PREFIX = {"claude": "cclocal", "kimi": "kimi", "local": "oclocal"}
 WORKER_LABEL = {
     "claude": "cclocal (Claude Code, официальный клиент от Anthropic)",
     "kimi": "kimi (Kimi CLI, официальный клиент от Moonshot AI)",
+    "local": "oclocal (OpenClaude, открытый клиент; локальная модель llama-server)",
 }
 PERMISSION_NOTE = {
     "claude": (
@@ -85,6 +86,12 @@ PERMISSION_NOTE = {
         "протокола: не выполняй деструктивных и внешних действий сверх явно\n"
         "требуемого текстом задачи, не ослабляй permissions; при любом\n"
         "сомнении оформляй blocked вместо действия."
+    ),
+    "local": (
+        "У тебя нет интерактивного подтверждения: клиент запущен headless\n"
+        "(openclaude --print) с --permission-mode default, любое действие\n"
+        "вне allowlist настроек проекта отклоняется автоматически — при\n"
+        "таком отказе оформляй blocked."
     ),
 }
 
@@ -129,6 +136,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--prompt-template", default=str(HERE / "dispatcher_prompt.md"))
     p.add_argument("--claude-launcher", default=str(HERE / "cclocal_headless.sh"))
     p.add_argument("--kimi-launcher", default=str(HERE / "kimi_headless.sh"))
+    p.add_argument("--local-launcher", default=str(HERE / "oclocal_headless.sh"))
+    p.add_argument("--local-mcp-config", default=str(HERE / "mcp.local.json"),
+                   help="local worker: --strict-mcp-config source (AGENT_ID=local)")
     p.add_argument("--workspace", default=str(WORKSPACE),
                    help="worker cwd; project MCP configs live here")
     p.add_argument("--mcp-config", default=str(WORKSPACE / ".mcp.json"),
@@ -513,6 +523,24 @@ def _worker_command(args: argparse.Namespace, con: sqlite3.Connection,
             "none",
             "--mcp-config",
             args.mcp_config,
+            "--strict-mcp-config",
+        ]
+        return argv, prompt.encode("utf-8"), {}
+    if recipient == "local":
+        # OpenClaude headless: same flag surface as the claude branch, but
+        # permissions come from --permission-mode default + the project
+        # settings allowlist (vibe_coding/.openclaude/settings.local.json),
+        # and the bridge MCP identity is the executor's own AGENT_ID=local.
+        argv = [
+            args.local_launcher,
+            "--print",
+            "--output-format",
+            "json",
+            "--no-session-persistence",
+            "--permission-mode",
+            "default",
+            "--mcp-config",
+            args.local_mcp_config,
             "--strict-mcp-config",
         ]
         return argv, prompt.encode("utf-8"), {}
