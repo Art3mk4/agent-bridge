@@ -1,10 +1,10 @@
 # Agent Bridge
 
-Local MCP message bridge for **Claude Code** and **Kimi CLI**.
+Local MCP message bridge for **Claude Code**, **Kimi CLI** and **OpenClaude**.
 
-Agent Bridge lets two coding agents exchange tasks, results and bounded autonomous conversations through one shared SQLite database. It uses MCP stdio transport and local files only — no TCP/UDP server, no external service and no network protocol of its own.
+Agent Bridge lets coding agents exchange tasks, results and bounded autonomous conversations through one shared SQLite database. It uses MCP stdio transport and local files only — no TCP/UDP server, no external service and no network protocol of its own.
 
-The reference Claude Code setup runs the Claude-side worker against **Strata**, model `qwen3.8-flash-next-unsloth-ud-q4_k_xl`, through the local launcher. The bridge core itself is model-agnostic and can dispatch work to any compatible agent client.
+The reference Claude Code setup runs the Claude-side worker against **Strata**, model `qwen3.8-flash-next-unsloth-ud-q4_k_xl`, through the local launcher; the `local` side runs an OpenClaude worker against the same model through its OpenAI-compatible endpoint. The bridge core itself is model-agnostic and can dispatch work to any compatible agent client.
 
 > **Status: experimental.** The main exchange flow is implemented and covered by tests, but the project is still evolving. See [TODO.md](TODO.md) for known gaps.
 
@@ -12,6 +12,7 @@ The reference Claude Code setup runs the Claude-side worker against **Strata**, 
 
 - **Claude Code worker:** local headless Claude Code launcher, configured for **Strata**, model `qwen3.8-flash-next-unsloth-ud-q4_k_xl`.
 - **Kimi CLI worker:** official Kimi CLI in prompt mode.
+- **OpenClaude worker:** open OpenClaude client run headless against the local model through its OpenAI-compatible endpoint (llama-server / Strata).
 - **Agent Bridge core:** Python 3.11+, MCP stdio transport and SQLite.
 
 ## Highlights
@@ -29,7 +30,7 @@ The reference Claude Code setup runs the Claude-side worker against **Strata**, 
 
 ```text
 Claude Code session ── MCP stdio ──► server.py (AGENT_ID=claude) ─┐
-                                                                   ├──► bridge.db
+OpenClaude session ─── MCP stdio ──► server.py (AGENT_ID=local) ──┼──► bridge.db
 Kimi CLI session ───── MCP stdio ──► server.py (AGENT_ID=kimi) ───┘
                                         ▲
                                         │ scan / dispatch
@@ -37,10 +38,13 @@ Kimi CLI session ───── MCP stdio ──► server.py (AGENT_ID=kimi) �
                                         │
                               systemd/on_message.py
                                         │
-                         one-shot Claude or Kimi worker
+                  one-shot Claude, Kimi or OpenClaude worker
+              (cclocal_headless.sh / kimi_headless.sh /
+              oclocal_headless.sh → OpenClaude on the local model
+              through the OpenAI-compatible llama-server/Strata endpoint)
 ```
 
-Each MCP server process derives its sender identity from `AGENT_ID`; tool arguments cannot impersonate another sender. Both sides point at the same `bridge.db`, but use opposite values of `AGENT_ID`. Agent ids are fixed (`claude` and `kimi`, `AGENTS` in `server.py`); the name `cclocal` elsewhere in this README is only the local launcher/integration name and the report prefix for the `claude` side — `AGENT_ID=cclocal` is rejected.
+Each MCP server process derives its sender identity from `AGENT_ID`; tool arguments cannot impersonate another sender. All three sessions point at the same `bridge.db`, each with its own value of `AGENT_ID`. Agent ids are fixed (`claude`, `kimi` and `local`, `AGENTS` in `server.py`); the names `cclocal` and `oclocal` elsewhere in this README are only the local launcher/integration names and the report prefixes for the `claude` and `local` sides — `AGENT_ID=cclocal` and `AGENT_ID=oclocal` are rejected.
 
 Interactive MCP sessions do not receive push notifications: an active agent checks `receive_messages` when it is already running. The optional listener adds the headless path: it scans the database, runs `on_message.py` for one dispatchable message and waits until that supervisor exits before scanning again.
 
@@ -49,7 +53,7 @@ Interactive MCP sessions do not receive push notifications: an active agent chec
 - Linux or another POSIX environment
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/)
-- Claude Code and/or Kimi CLI, depending on the side being automated
+- Claude Code, Kimi CLI and/or OpenClaude, depending on the side being automated
 
 ## Quick start
 
@@ -138,6 +142,16 @@ Add the following to the project-scoped Kimi MCP configuration, changing the abs
 
 Start a new Kimi session from the project and trust the workspace if the MCP command is expected.
 
+### OpenClaude
+
+Register the bridge through the tracked [`systemd/mcp.local.json`](systemd/mcp.local.json), which starts `server.py` with `AGENT_ID=local` and references the repository as `${AGENT_BRIDGE_DIR}`. The variable is **required and has no default**: OpenClaude expands `${VAR}` client-side and fails the connection with a "Missing environment variables" error naming it. `systemd/oclocal_headless.sh` exports `AGENT_BRIDGE_DIR` itself from its own location, so the headless path works from any clone layout; an interactive launch must export it beforehand. Pin the config file when starting the session:
+
+```bash
+openclaude --mcp-config /absolute/path/to/agent-bridge/systemd/mcp.local.json --strict-mcp-config
+```
+
+An interactive OpenClaude session must never load the project `.mcp.json` used by the Claude Code worker — that file registers the same bridge as `claude`.
+
 ## Tools
 
 | Tool | Purpose |
@@ -178,6 +192,26 @@ The server enforces pairing and direction: a `result` answers a `task`, a follow
 
 Terminal conversations accept no new tasks or results. Hard dispatch failures freeze the dialogue so a broken chain cannot continue automatically.
 
+## Manager–worker pattern
+
+The bounded-conversation primitives fit a division of labor between the two local sides:
+
+- **`claude` — manager and reviewer.** An interactive Claude Code session owns architecture, research and review: it writes the goal, breaks it into concrete tasks and judges every result against the repository.
+- **`local` — executor.** A headless OpenClaude worker performs the approved work. There is no human in its loop: actions outside the project allowlist are denied automatically, and the honest outcome for anything it cannot complete is a `blocked:` report instead of a risky action.
+
+The loop:
+
+```text
+manager (claude)                       worker (local)
+  start_conversation ── task ──────────► claim, execute
+        ◄──────────────── result ────── report done / blocked
+  review the result
+  ├─ follow-up task (concrete fixes) ──► next turn
+  └─ complete / needs_human
+```
+
+Only the manager opens conversations and only the manager decides the terminal action after a result. A `blocked` report is a normal review input, not a dispatch failure: the manager either narrows the task to what the allowlist actually permits or does the denied step itself in the interactive session.
+
 ## Automatic delivery and progress
 
 The default automation gate is:
@@ -186,13 +220,14 @@ The default automation gate is:
 {
   "auto": {
     "claude": true,
-    "kimi": false
+    "kimi": false,
+    "local": true
   },
   "dispatch_max_age_seconds": 86400
 }
 ```
 
-Claude-side headless execution is enabled by default in this configuration. Kimi-side headless execution remains disabled because Kimi CLI prompt mode applies its own automatic permission policy without interactive approvals; enable `auto.kimi` only as a deliberate local decision.
+Claude-side and `local`-side headless execution are enabled by default in this configuration. Kimi-side headless execution remains disabled because Kimi CLI prompt mode applies its own automatic permission policy without interactive approvals; enable `auto.kimi` only as a deliberate local decision.
 
 `dispatch_max_age_seconds` (default 24 h) bounds automatic delivery by message **age**. A message that arrived while the listener was stopped, restarting or busy with another worker is still dispatched when it comes back, even if its `response_deadline` has passed — the deadline is metadata for the worker and the human. Only a backlog older than the bound is left alone: `listener.py pending` lists it and a manual `on_message.py <id>` runs one message on purpose.
 
@@ -217,6 +252,8 @@ uv run python systemd/listener.py enable   --agent claude
 - `last`: the previous dispatch outcome, including duration and exit code where available.
 
 `listener pending` is a read-only backlog report: never-attempted messages that could wake a worker, split into `dispatchable` (the listener will take them) and `stale` (older than `dispatch_max_age_seconds`). It prints ids and ages only and never writes to the database.
+
+Progress reflects the supervisor lifecycle only: a message moves `received` → `supervising` → `finished`, and the `last` segment carries the outcome of the most recent dispatch. Worker-internal stages (tool calls, intermediate reasoning) are neither transmitted nor planned.
 
 From an MCP session the same human-readable snapshot is one call: `listener(action="progress")` returns `{"line": ...}` — the exact string the cclocal status line renders, e.g. `[claude] idle | last msg#43 sender=kimi result=succeeded in 21.5s rc=0`. It is ids, enums and numbers only, never task payload, and the call never raises.
 
@@ -271,12 +308,31 @@ Once work flows, the same command grows the current-dispatch and history segment
 
 This is optional local configuration; Agent Bridge does not modify global Claude settings by itself — enabling it is a deliberate per-machine decision.
 
+### OpenClaude status line
+
+OpenClaude supports the same `statusLine` settings key, and the bridge ships a ready-made command: `systemd/statusline.sh` (executable, derives the bridge location from its own path, always exits 0). It prints the `local` worker's dispatch state, e.g. `[local] supervising msg#123 sender=claude supervisor=564040 for 12s` — so an interactive OpenClaude window shows when a delegated task was received and is being executed.
+
+Register it in `~/.openclaude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "/absolute/path/to/agent-bridge/systemd/statusline.sh",
+    "refreshInterval": 5
+  }
+}
+```
+
+**Refresh behavior:** stock OpenClaude re-runs a status line command on TUI events only (assistant message, mode switches), so the line updates between events but does not tick on a timer; it also strips the unknown `refreshInterval` key instead of failing the file, so the snippet above is safe on a stock build. Periodic refresh requires a build with the `statusLine.refreshInterval` patch (proposed upstream; locally applied via `npm link` from a patched clone). The same output contract as everywhere else: ids, enums and numbers only, never task text.
+
 ## Worker launchers
 
 The supervisor chooses a launcher by recipient:
 
 - `systemd/cclocal_headless.sh` starts a non-interactive Claude Code worker. It is an example integration for a local Claude-compatible wrapper and expects the local environment variables used by that wrapper.
 - `systemd/kimi_headless.sh` starts the official Kimi CLI in prompt mode and passes the task through a private request file so task text does not appear in argv or the process list.
+- `systemd/oclocal_headless.sh` starts a non-interactive OpenClaude worker (`openclaude --print`). It strips the inherited `ANTHROPIC_*` variables so the OpenAI-compatible endpoint of the local llama-server is the only provider the child can see, and exports `AGENT_BRIDGE_DIR` from its own location so `systemd/mcp.local.json` resolves from any clone layout. Permissions: `--permission-mode default` plus the project allowlist — there is no human to approve anything, so every action outside the allowlist is denied automatically.
 
 For public or team use, review these launchers and adapt them to your own client wrappers and permission model. Do not weaken static deny rules or hide permission requests.
 
