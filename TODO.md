@@ -34,10 +34,11 @@
 - [x] **P1-1. Расширить progress/status безопасными метаданными сообщения.**
   - Закрыто 2026-11-02: `progress_line` показывает `sender` (строгий read-only запрос из bridge.db: `mode=ro`, `Path.exists()` до connect, `busy_timeout=1000`, любая ошибка → без sender) в текущем и `last`-сегментах; `conversation_id`/`kind` пока не показываются (отдельная задача при необходимости).
 
-- [ ] **P1-2. Зафиксировать границы прогресса выполнения.**
+- [x] **P1-2. Зафиксировать границы прогресса выполнения.**
   - Наблюдение: сейчас отображается lifecycle listener/supervisor; внутренний ход worker не передаётся.
   - Нужно: либо добавить поддерживаемые этапы worker, либо явно описать, что доступен только lifecycle supervisor.
   - Критерий закрытия: README, MCP `listener(status)` и CLI `progress` единообразно описывают доступный уровень детализации.
+  - Закрыто 2026-11-15: выбрано явное описание границы (этапы воркера не передаются и не планируются). README «Automatic delivery and progress», TOOLS.md §2 (CLI status) и описание MCP `listener(progress)` единообразно фиксируют: доступен только lifecycle супервизора (`received → supervising → finished` + `last`). Выполнено headless-воркером `local` (диалог 6, msg#95/96, commit 115cc21), ревью и двойной прогон `test_dispatcher.py` (ALL PASSED, 57 тестов) — менеджером.
 
 - [x] **P1-3. Подготовить опциональную индикацию в Claude Code UI.**
   - Закрыто 2026-11-02: создан `~/.claude-local/statusline-agent-bridge.sh` (0755, `stderr→/dev/null`, exit 0 всегда, ~0.04 с); в `~/.claude-local/settings.json` добавлен `statusLine` (`type=command`, `refreshInterval=2`, `theme` сохранён). Работает в новых интерактивных сессиях cclocal; ограничение (только интерактивные сессии) задокументировано в README.
