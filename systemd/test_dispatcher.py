@@ -2939,6 +2939,196 @@ def test_64_bridge_agent_command_contract(d: Path):
           "oclocal:<id>:result" in oc_text, "")
     check("cc uses the cclocal dedup prefix",
           "cclocal:<id>:result" in cc_text, "")
+    check("cc refuses to start a shift while the listener runs",
+          "running=true" in cc_text, "")
+
+
+# ------------------------------------------- dispatch robustness regressions
+
+def test_65_rotation_error_does_not_abandon_worker(d: Path):
+    # An OSError from output rotation happens AFTER the worker is spawned
+    # (a sibling supervisor deletes a file between glob() and stat(); a
+    # dangling symlink reproduces it deterministically). It used to be
+    # caught as "spawn failed": attempt failed + false notice + frozen
+    # dialogue, pid never recorded, the running worker left unsupervised.
+    db = new_db(d)
+    cfg = write_cfg(d)
+    rt = d / "runtime"
+    rt.mkdir(parents=True, exist_ok=True)
+    os.symlink(d / "vanished", rt / "worker_999999.out")
+    cid, mid = seed_conv(db)
+    r = sup_run(d, db, cfg, mid, "--auto")
+    check("rc0", r.returncode == 0, r.stderr[-400:])
+    a = attempt_row(db, mid)
+    check("attempt succeeded, not spawn-failed",
+          a is not None and a[0] == "succeeded", str(a))
+    check("worker pid recorded",
+          q1(db, "SELECT pid FROM dispatch_attempts WHERE message_id=?",
+             mid)[0] is not None)
+    check("no dispatch-error notice", notice_row(db, mid) is None)
+    check("conversation still active", conv_state(db, cid) == "active")
+
+
+def test_66_listener_backs_off_without_attempt_row(d: Path):
+    # A supervisor that exits before writing its attempt row leaves the
+    # message a candidate. The listener re-ran it ~50 times a second; now it
+    # backs off exponentially while no attempt appears.
+    db = new_db(d)
+    cfg = write_cfg(d)
+    rt = d / "runtime"
+    seed(db)
+    calls = d / "calls.txt"
+    dying = d / "dying_supervisor.py"
+    dying.write_text(f"open({str(calls)!r}, 'a').write('x\\n')\n"
+                     "raise SystemExit(4)\n", encoding="utf-8")
+    p = spawn_listener("claude", rt, db=db, cfg=cfg, on_message=dying,
+                       env=listener_env())
+    try:
+        check("first dispatch happened",
+              wait_for(lambda: calls.exists(), timeout=10.0))
+        time.sleep(4.0)
+        n = len(calls.read_text().splitlines())
+        check("backoff: at most 3 runs in ~4 s", n <= 3, f"runs={n}")
+        log = (rt / "dispatcher.log").read_text(errors="replace")
+        check("backoff is logged", "no attempt recorded" in log, log[-300:])
+    finally:
+        stop_listener("claude", rt, cfg, proc=p)
+
+
+def test_67_answered_message_is_not_redispatched(d: Path):
+    # An interactive bridge-agent shift answers "blocked: ..." under the
+    # prescribed '<prefix>:<id>:result' key and releases the message, with no
+    # dispatch_attempts row. Re-enabling the listener must not run the task
+    # again headless (its report would be swallowed by that dedup key).
+    db = new_db(d)
+    cfg = write_cfg(d)
+    rt = d / "runtime"
+    mid = seed(db)
+    seed(db, sender="claude", recipient="kimi", reply_to=mid,
+         text="blocked: нет прав", dedup=f"cclocal:{mid}:result")
+    other = seed(db)                       # a notice is not an answer
+    con = sqlite3.connect(db)
+    con.execute("INSERT INTO messages (sender, recipient, text, reply_to,"
+                " created_at, response_deadline, kind)"
+                " VALUES ('claude','kimi','служебное',?,?,?,'notice')",
+                (other, time.time(), time.time() + 60))
+    con.commit()
+    con.close()
+    r = listener_cli("pending", "claude", rt, db=db, cfg=cfg)
+    doc = json.loads(r.stdout)
+    ids = [x["message"] for x in doc["dispatchable"]]
+    check("answered message is not dispatchable", mid not in ids, r.stdout)
+    check("message with only a notice reply still is", other in ids, r.stdout)
+    r = sup_run(d, db, cfg, mid, "--auto")
+    check("auto run skips it", r.returncode == 0, r.stderr[-300:])
+    check("no attempt row", attempt_row(db, mid) is None)
+    check("no worker ran", runs_of(d) == [], str(runs_of(d)))
+    r = sup_run(d, db, cfg, mid)           # manual = the human decision
+    check("manual run still dispatches",
+          runs_of(d) == [f"RAN {mid} via=stdin agent=claude"],
+          str(runs_of(d)) + r.stderr[-300:])
+
+
+def test_68_oclocal_launcher_env(d: Path):
+    # Optional variables must not kill the launcher under `set -u`, the
+    # endpoint has no machine-specific default, and a base URL that already
+    # ends in /v1 is not doubled.
+    launcher = HERE / "oclocal_headless.sh"
+    fake = d / "fake_openclaude.sh"
+    fake.write_text('#!/bin/sh\necho "url=$OPENAI_BASE_URL'
+                    ' model=$OPENAI_MODEL"\n', encoding="utf-8")
+    fake.chmod(0o755)
+
+    def run(env_text: str) -> subprocess.CompletedProcess:
+        envf = d / "aliases"
+        envf.write_text(env_text, encoding="utf-8")
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("LOCAL_CLAUDE_", "LOCAL_API_"))}
+        env.update(OCLOCAL_ENV_FILE=str(envf),
+                   OCLOCAL_OPENCLAUDE_BIN=str(fake))
+        return subprocess.run(["bash", str(launcher), "--print"],
+                              capture_output=True, text=True, timeout=30,
+                              env=env, stdin=subprocess.DEVNULL)
+
+    r = run("LOCAL_CLAUDE_BASE_URL=http://127.0.0.1:1\n"
+            "LOCAL_CLAUDE_MODEL=m1\n")
+    check("minimal env runs", r.returncode == 0, r.stderr[-300:])
+    check("url gets /v1", "url=http://127.0.0.1:1/v1 model=m1" in r.stdout,
+          r.stdout)
+    r = run("LOCAL_CLAUDE_BASE_URL=http://h:8080/v1/\nLOCAL_CLAUDE_MODEL=m\n")
+    check("trailing /v1 not doubled", "url=http://h:8080/v1 " in r.stdout,
+          r.stdout + r.stderr[-200:])
+    r = run("LOCAL_CLAUDE_MODEL=m\n")
+    check("missing base url fails loudly",
+          r.returncode != 0 and "LOCAL_CLAUDE_BASE_URL" in r.stderr,
+          f"rc={r.returncode} {r.stderr[-200:]}")
+    check("no hard-coded LAN endpoint",
+          "192.168." not in launcher.read_text(encoding="utf-8"))
+
+
+def test_69_enable_reports_running(d: Path):
+    # enable used to answer from a status read taken right after Popen, so
+    # a successful start reported running=false.
+    db = new_db(d)
+    cfg = write_cfg(d, claude=False)
+    rt = d / "runtime"
+    r = listener_cli("enable", "claude", rt, db=db, cfg=cfg,
+                     on_message=FAKE_SUPERVISOR)
+    try:
+        doc = json.loads(r.stdout)
+        check("enable started", doc.get("action") == "started", r.stdout)
+        check("enable answer says running", doc.get("running") is True
+              and isinstance(doc.get("pid"), int), r.stdout)
+    finally:
+        stop_listener("claude", rt, cfg)
+
+
+def test_70_mark_read_counts_only_new_acks(d: Path):
+    db = new_db(d)
+    server = import_server(d / "errors.log")
+    old_db, old_agent = server.DB_PATH, os.environ.get("AGENT_ID")
+    server.DB_PATH = db
+    os.environ["AGENT_ID"] = "claude"
+    try:
+        mid = seed(db)
+        first = server.mark_read([mid])
+        again = server.mark_read([mid])
+        check("first ack counted", first == {"acknowledged": 1}, str(first))
+        check("repeat ack not counted", again == {"acknowledged": 0},
+              str(again))
+    finally:
+        server.DB_PATH = old_db
+        if old_agent is None:
+            os.environ.pop("AGENT_ID", None)
+        else:
+            os.environ["AGENT_ID"] = old_agent
+
+
+def test_71_agent_lists_agree(d: Path):
+    # The agent set lives in five places; a third agent was added by hand to
+    # each. Guard against the next one missing a spot.
+    import importlib.util
+
+    def load(name: str, path: Path):
+        spec = importlib.util.spec_from_file_location(name, path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    sm = load("t71_schema", HERE / "schema.py")
+    lm = load("t71_listener", LISTENER)
+    om = load("t71_on_message", ON_MESSAGE)
+    server = import_server(d / "errors.log")
+    want = set(sm.AGENTS)
+    for name, got in (("server.AGENTS", set(server.AGENTS)),
+                      ("listener.AGENTS", set(lm.AGENTS)),
+                      ("schema.DEFAULT_AUTO", set(sm.DEFAULT_AUTO)),
+                      ("on_message.AGENT_PREFIX", set(om.AGENT_PREFIX)),
+                      ("on_message.WORKER_LABEL", set(om.WORKER_LABEL)),
+                      ("on_message.PERMISSION_NOTE",
+                       set(om.PERMISSION_NOTE))):
+        check(f"{name} matches schema.AGENTS", got == want,
+              f"{sorted(got)} != {sorted(want)}")
 
 
 def main() -> int:
@@ -3002,6 +3192,13 @@ def main() -> int:
         test_62_server_init_lock_raises_runtimeerror,
         test_63_status_stage_causes,
         test_64_bridge_agent_command_contract,
+        test_65_rotation_error_does_not_abandon_worker,
+        test_66_listener_backs_off_without_attempt_row,
+        test_67_answered_message_is_not_redispatched,
+        test_68_oclocal_launcher_env,
+        test_69_enable_reports_running,
+        test_70_mark_read_counts_only_new_acks,
+        test_71_agent_lists_agree,
     ]
     try:
         for fn in tests:

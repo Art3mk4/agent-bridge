@@ -236,6 +236,12 @@ def _init_db() -> None:
                 "ON messages (conversation_id, id)"
                 " WHERE conversation_id IS NOT NULL"
             )
+            # The dispatch scan asks "has the recipient already answered this
+            # message?" once per candidate every second (schema.py).
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_reply_to "
+                "ON messages (reply_to) WHERE reply_to IS NOT NULL"
+            )
             con.execute(
                 "CREATE INDEX IF NOT EXISTS idx_conv_transitions "
                 "ON conversation_transitions (conversation_id, id)"
@@ -1035,9 +1041,11 @@ def mark_read(message_ids: list[int]) -> dict[str, Any]:
     now = time.time()
     con = _connect()
     try:
+        # acknowledged = 0: an id that is already acknowledged is skipped
+        # (as documented) instead of being counted again.
         cur = con.executemany(
             "UPDATE messages SET acknowledged = 1"
-            " WHERE id = ? AND recipient = ?"
+            " WHERE id = ? AND recipient = ? AND acknowledged = 0"
             " AND (claim_expires_at IS NULL OR claim_expires_at <= ?"
             "      OR claimed_by = ?)",
             [(i, agent, now, WORKER_ID) for i in ids],

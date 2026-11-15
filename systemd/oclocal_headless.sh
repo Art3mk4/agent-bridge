@@ -40,8 +40,11 @@ if [[ -z "$key" && -n "${LOCAL_CLAUDE_KEY_FILE:-}" && -s "$LOCAL_CLAUDE_KEY_FILE
 fi
 key="${key:-local-dummy}"
 
-url="${LOCAL_CLAUDE_BASE_URL:-http://192.168.2.15:8080}"
-url="${url%/}/v1"
+# Required, like in cclocal_headless.sh: no machine-specific default endpoint
+# baked into the repository. A base URL that already ends in /v1 is accepted.
+url="${LOCAL_CLAUDE_BASE_URL:?LOCAL_CLAUDE_BASE_URL is not defined in $ENV_FILE}"
+url="${url%/}"
+url="${url%/v1}/v1"
 host="${url#*://}"
 host="${host%%[:/]*}"
 np="${NO_PROXY:+$NO_PROXY,}127.0.0.1,localhost,$host"
@@ -54,8 +57,8 @@ exec env \
     CLAUDE_CODE_USE_OPENAI=1 \
     OPENAI_BASE_URL="$url" \
     OPENAI_API_KEY="$key" \
-    OPENAI_MODEL="$LOCAL_CLAUDE_MODEL" \
-    CLAUDE_CODE_AUTO_COMPACT_WINDOW="$LOCAL_CLAUDE_AUTO_COMPACT" \
-    API_TIMEOUT_MS="$LOCAL_API_TIMEOUT_MS" \
+    OPENAI_MODEL="${LOCAL_CLAUDE_MODEL:?LOCAL_CLAUDE_MODEL is not defined in $ENV_FILE}" \
+    CLAUDE_CODE_AUTO_COMPACT_WINDOW="${LOCAL_CLAUDE_AUTO_COMPACT:-}" \
+    API_TIMEOUT_MS="${LOCAL_API_TIMEOUT_MS:-}" \
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
     "$OPENCLAUDE_BIN" "$@"

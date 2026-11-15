@@ -251,6 +251,18 @@ class Skip(Exception):
     """Benign validation reject: log and exit 0, no attempt row."""
 
 
+class SpawnError(Exception):
+    """The worker never started: prompt template unreadable, launcher missing
+    or not executable, bad workspace. Carries the original exception type
+    name only (never its message, which may contain paths or payload). Raised
+    ONLY before a worker process exists — anything that goes wrong after the
+    spawn must not be mistaken for it, or a running worker is abandoned."""
+
+    def __init__(self, kind: str):
+        super().__init__(kind)
+        self.kind = kind
+
+
 def _validate(con: sqlite3.Connection, message_id: int, auto: bool,
               args: argparse.Namespace, log: logging.Logger) -> tuple:
     row = _fetch_message(con, message_id)
@@ -291,6 +303,12 @@ def _validate(con: sqlite3.Connection, message_id: int, auto: bool,
         elif reply_to is not None:
             # Legacy anti-loop barrier: only root tasks may wake a worker.
             raise Skip(f"message {message_id} is a reply, root tasks only")
+        # Same rule as the listener scan (schema.find_candidates): a message
+        # its recipient already answered — e.g. "blocked:" from an
+        # interactive bridge-agent shift — is not run again headless.
+        if _schema_mod().answered_by_recipient(con, message_id):
+            raise Skip(f"message {message_id} already answered by its "
+                       f"recipient, leaving it to a human")
         # response_deadline is metadata, not a dispatch gate (P1-8): a
         # message that arrived while the listener was down is still
         # delivered. Only an old backlog waits for a human.
@@ -490,11 +508,20 @@ def _build_prompt(template: str, row: tuple,
 
 
 def _rotate_outputs(runtime_dir: Path) -> None:
+    """Keep the newest OUTPUT_KEEP files per pattern. Never raises: it runs
+    right after a worker has been spawned, and supervisors of different
+    agents share one runtime directory, so a file can vanish between glob()
+    and stat() because a sibling rotated it first. lstat(): a dangling
+    symlink is just an old entry, not an error."""
     for pattern in ("worker_*.out", "request_*.txt"):
-        files = sorted(
-            runtime_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True
-        )
-        for old in files[OUTPUT_KEEP:]:
+        entries: list[tuple[float, str, Path]] = []
+        for path in runtime_dir.glob(pattern):
+            try:
+                entries.append((path.lstat().st_mtime, path.name, path))
+            except OSError:
+                continue  # already gone: rotated by a sibling supervisor
+        entries.sort(reverse=True)
+        for _mtime, _name, old in entries[OUTPUT_KEEP:]:
             try:
                 old.unlink()
             except OSError:
@@ -563,32 +590,43 @@ def _worker_command(args: argparse.Namespace, con: sqlite3.Connection,
 def _run_worker(args: argparse.Namespace, con: sqlite3.Connection, row: tuple,
                 runtime_dir: Path, log: logging.Logger) -> tuple[int | None, bool]:
     message_id, recipient = row[0], row[2]
-    argv, prompt_stdin, extra_env = _worker_command(args, con, row, runtime_dir)
-    out_path = runtime_dir / f"worker_{message_id}.out"
-    out_fd = os.open(out_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-    env = os.environ.copy()  # each launcher rebuilds its own client env
-    env.update(extra_env)
     try:
-        proc = subprocess.Popen(  # no shell=True, direct argv
-            argv,
-            stdin=(subprocess.PIPE if prompt_stdin is not None
-                   else subprocess.DEVNULL),
-            stdout=out_fd,
-            stderr=subprocess.STDOUT,
-            cwd=args.workspace,
-            start_new_session=True,  # own group, killed as a whole on timeout
-            env=env,
+        argv, prompt_stdin, extra_env = _worker_command(
+            args, con, row, runtime_dir)
+        out_path = runtime_dir / f"worker_{message_id}.out"
+        out_fd = os.open(out_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        env = os.environ.copy()  # each launcher rebuilds its own client env
+        env.update(extra_env)
+        try:
+            proc = subprocess.Popen(  # no shell=True, direct argv
+                argv,
+                stdin=(subprocess.PIPE if prompt_stdin is not None
+                       else subprocess.DEVNULL),
+                stdout=out_fd,
+                stderr=subprocess.STDOUT,
+                cwd=args.workspace,
+                start_new_session=True,  # own group, killed whole on timeout
+                env=env,
+            )
+        finally:
+            os.close(out_fd)
+    except OSError as exc:
+        raise SpawnError(type(exc).__name__) from exc
+    # From here on a worker process exists. Its pid goes into the attempt row
+    # first — that is what lets _reconcile tell a live worker from a dead one
+    # if this supervisor dies — and nothing below may abandon it.
+    try:
+        con.execute(
+            "UPDATE dispatch_attempts SET pid = ? WHERE message_id = ?",
+            (proc.pid, message_id),
         )
-    finally:
-        os.close(out_fd)
-    _rotate_outputs(runtime_dir)  # after the current file exists: dir keeps ≤20
-    con.execute(
-        "UPDATE dispatch_attempts SET pid = ? WHERE message_id = ?",
-        (proc.pid, message_id),
-    )
-    con.commit()
+        con.commit()
+    except sqlite3.Error as exc:
+        log.warning("could not record worker pid message_id=%s kind=%s",
+                    message_id, type(exc).__name__)
     log.info("worker spawned message_id=%s recipient=%s pid=%s",
              message_id, recipient, proc.pid)
+    _rotate_outputs(runtime_dir)  # after the current file exists: dir keeps ≤20
     timed_out = False
     try:
         proc.communicate(input=prompt_stdin, timeout=args.worker_timeout)
@@ -880,12 +918,14 @@ def _process_message(con: sqlite3.Connection, message_id: int,
     log.info("dispatching message_id=%s recipient=%s", message_id, row[2])
     try:
         exit_code, timed_out = _run_worker(args, con, row, runtime_dir, log)
-    except OSError as exc:
+    except SpawnError as exc:
         # The worker never started (missing/non-executable launcher, bad
         # workspace, unreadable prompt template). Without this the attempt
         # stayed 'spawned' until a later reconcile relabelled it
-        # 'interrupted' — and the sender was never told.
-        kind = type(exc).__name__
+        # 'interrupted' — and the sender was never told. Only SpawnError:
+        # an OSError after the spawn used to land here too and abandoned a
+        # RUNNING worker as "failed" with a false notice to the sender.
+        kind = exc.kind
         log.error("worker spawn failed message_id=%s kind=%s", message_id, kind)
         _finish_attempt(con, message_id, STATE_FAILED, None, f"spawn:{kind}")
         _mark_conversation_blocked(con, row[9], log)

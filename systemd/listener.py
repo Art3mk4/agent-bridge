@@ -87,6 +87,9 @@ AGENTS = {"kimi", "claude", "local"}
 POLL_SECONDS = 1.0
 SLEEP_SLICE = 0.2
 MAX_BACKOFF_SECONDS = 60.0
+# How long an explicit enable waits for the new listener to write its pidfile,
+# so its answer says running=true instead of racing the child's startup.
+ENABLE_WAIT_SECONDS = 3.0
 # on_message self-limits workers at 3300 s; this is only the watchdog for a
 # wedged supervisor. Crossing it kills only the supervisor's own process
 # group (it was started with start_new_session), never anything unverified.
@@ -560,8 +563,12 @@ def _dispatch_and_wait(agent: str, mid: int, db: str, config: str,
     decided nowhere near here — on_message writes it to dispatch_attempts and
     the caller reads it back.
     """
+    # --runtime-dir: the supervisor's log, worker output and kimi request
+    # files belong next to this listener's own runtime files, not in the
+    # supervisor's built-in default.
     cmd = [sys.executable, str(on_message), str(mid),
-           "--db", str(db), "--config", str(config), "--auto"]
+           "--db", str(db), "--config", str(config), "--auto",
+           "--runtime-dir", str(rt)]
     try:
         proc = subprocess.Popen(  # no shell; argv carries ids/paths only
             cmd,
@@ -636,6 +643,12 @@ def run(agent: str, db: str, config: str, runtime_dir: str,
         progress = _ProgressTracker(rt, agent, os.getpid())
         _ensure_schema(agent, db, rt)
         fails = 0
+        # Dispatches in a row that left no dispatch_attempts row: the
+        # supervisor died before its retry barrier (crash at start, spawn
+        # failure, a validation rule the scan does not share). The same
+        # message is still a candidate then, and without a pause the loop
+        # re-ran it ~50 times a second forever.
+        no_attempt = 0
         while True:
             if _is_disabled(rt, agent):
                 _log(rt, f"agent={agent} disabled, exiting (no PID killed)")
@@ -666,14 +679,24 @@ def run(agent: str, db: str, config: str, runtime_dir: str,
             # ahead of the real sequence received → supervising → finished.
             progress.received(mid)
             started = time.time()
-            _outcome, _sup_pid, sup_rc = _dispatch_and_wait(
+            outcome, _sup_pid, sup_rc = _dispatch_and_wait(
                 agent, mid, db, config, rt, on_message, progress)
             # One write, whatever happened inside. The result is the
             # supervisor's own state row, so the listener cannot disagree with
             # on_message about what an outcome means.
-            progress.finished(mid, _attempt_result(db, mid), sup_rc,
-                              time.time() - started)
+            result = _attempt_result(db, mid)
+            progress.finished(mid, result, sup_rc, time.time() - started)
             _set_state(rt, agent, "idle")
+            if result is None:
+                no_attempt += 1
+                delay = min(MAX_BACKOFF_SECONDS, 2.0 ** no_attempt)
+                _log(rt, f"agent={agent} no attempt recorded message={mid} "
+                         f"outcome={outcome} rc={sup_rc} #{no_attempt}, "
+                         f"backoff {delay:.0f}s")
+                if not _sleeper(rt, agent, delay):
+                    break
+            else:
+                no_attempt = 0
         return 0
     finally:
         if progress is not None:
@@ -886,6 +909,12 @@ def enable(agent: str, db: str, config: str, runtime_dir: str,
                  f"kind={type(exc).__name__}")
     res = ensure_listener(agent, db, config, rt, on_message, honor_env=False)
     _log(rt, f"agent={agent} enable -> {res['status']}")
+    if res["status"] == "started":
+        # The child writes its pidfile a moment after Popen returns; answer
+        # with what the human will see one second later, not with the race.
+        end = time.monotonic() + ENABLE_WAIT_SECONDS
+        while _listener_pid(rt, agent) is None and time.monotonic() < end:
+            time.sleep(0.05)
     out = status(agent, config, rt)
     out["action"] = res["status"]
     return out
