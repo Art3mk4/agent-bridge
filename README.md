@@ -306,6 +306,24 @@ Once work flows, the same command grows the current-dispatch and history segment
 
 This is optional local configuration; Agent Bridge does not modify global Claude settings by itself — enabling it is a deliberate per-machine decision.
 
+### OpenClaude status line
+
+OpenClaude supports the same `statusLine` settings key, and the bridge ships a ready-made command: `systemd/statusline.sh` (executable, derives the bridge location from its own path, always exits 0). It prints the `local` worker's dispatch state, e.g. `[local] supervising msg#123 sender=claude supervisor=564040 for 12s` — so an interactive OpenClaude window shows when a delegated task was received and is being executed.
+
+Register it in `~/.openclaude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "/absolute/path/to/agent-bridge/systemd/statusline.sh",
+    "refreshInterval": 5
+  }
+}
+```
+
+**Refresh behavior:** stock OpenClaude re-runs a status line command on TUI events only (assistant message, mode switches), so the line updates between events but does not tick on a timer; it also strips the unknown `refreshInterval` key instead of failing the file, so the snippet above is safe on a stock build. Periodic refresh requires a build with the `statusLine.refreshInterval` patch (proposed upstream; locally applied via `npm link` from a patched clone). The same output contract as everywhere else: ids, enums and numbers only, never task text.
+
 ## Worker launchers
 
 The supervisor chooses a launcher by recipient:
