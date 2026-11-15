@@ -2884,6 +2884,63 @@ def test_63_status_stage_causes(d: Path):
 
 # ------------------------------------------------------------------- main
 
+def test_64_bridge_agent_command_contract(d: Path):
+    """commands/oc-bridge-agent.md and cc-bridge-agent.md are prompt
+    commands for interactive bridge-agent shifts (zero fork patches: the
+    client expands the markdown into a user message and the model runs the
+    loop through the bridge MCP tools). This guards the files against drift
+    away from the dispatch protocol in on_message._protocol_text."""
+    oc = ROOT / "commands" / "oc-bridge-agent.md"
+    cc = ROOT / "commands" / "cc-bridge-agent.md"
+    check("oc command file exists", oc.is_file(), str(oc))
+    check("cc command file exists", cc.is_file(), str(cc))
+    if not (oc.is_file() and cc.is_file()):
+        return
+    oc_text = oc.read_text(encoding="utf-8")
+    cc_text = cc.read_text(encoding="utf-8")
+
+    def frontmatter(text: str) -> dict:
+        m = re.match(r"^---\n(.*?)\n---\n", text, re.S)
+        head: dict = {}
+        if m:
+            for line in m.group(1).splitlines():
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    head[key.strip()] = value.strip()
+        return head
+
+    for name, text in (("oc", oc_text), ("cc", cc_text)):
+        head = frontmatter(text)
+        check(f"{name} frontmatter has description",
+              bool(head.get("description")), str(head))
+        check(f"{name} model invocation disabled",
+              head.get("disable-model-invocation") == "true",
+              head.get("disable-model-invocation", ""))
+        for token in (
+            "claim_message",
+            "lease_seconds=3600",
+            "receive_messages(wait_seconds=30)",
+            "mark_read",
+            "release_message",
+            'listener(action="status")',
+            ":<id>:result",
+            ":<id>:followup",
+            "blocked:",
+        ):
+            check(f"{name} protocol token '{token}'", token in text, "")
+    check("oc disables listener for the shift",
+          'listener(action="disable")' in oc_text, "")
+    check("oc re-enables listener on shift exit",
+          'listener(action="enable")' in oc_text, "")
+    check("cc never toggles the listener (disabled by design)",
+          'listener(action="disable")' not in cc_text
+          and 'listener(action="enable")' not in cc_text, "")
+    check("oc uses the oclocal dedup prefix",
+          "oclocal:<id>:result" in oc_text, "")
+    check("cc uses the cclocal dedup prefix",
+          "cclocal:<id>:result" in cc_text, "")
+
+
 def main() -> int:
     print(f"tmp: {TMP}")
     tests = [
@@ -2944,6 +3001,7 @@ def main() -> int:
         test_61_config_reader_and_workspace,
         test_62_server_init_lock_raises_runtimeerror,
         test_63_status_stage_causes,
+        test_64_bridge_agent_command_contract,
     ]
     try:
         for fn in tests:
