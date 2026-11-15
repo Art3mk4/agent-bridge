@@ -225,10 +225,40 @@ _ROOT_OR_LIVE_CONVERSATION = (
 )
 
 
+# A message its recipient has already answered is not work any more, even
+# without a dispatch_attempts row: an interactive bridge-agent shift (commands/
+# *-bridge-agent.md) claims, replies ("blocked: ..." or a result) and releases
+# without ever creating an attempt. Dispatching it again would re-run the task
+# headless after the human-visible answer, and the second report would be
+# swallowed by the '<prefix>:<id>:result' dedup key the first one already
+# took. Notices are operational, never an answer.
+_RECIPIENT_REPLIED = (
+    "EXISTS (SELECT 1 FROM messages r"
+    "        WHERE r.reply_to = m.id AND r.sender = m.recipient{notice})"
+)
+
+
+def _recipient_replied(conversations: bool) -> str:
+    """SQL condition on alias m: its recipient has replied to it. On a DB
+    without the conversations layer there is no kind column, and no notices
+    to exclude either."""
+    return _RECIPIENT_REPLIED.format(
+        notice=" AND r.kind IS NOT 'notice'" if conversations else "")
+
+
+def answered_by_recipient(con: sqlite3.Connection, message_id: int) -> bool:
+    """True when the recipient of message_id has already replied to it (the
+    same rule find_candidates applies), for callers that check one id."""
+    sql = ("SELECT 1 FROM messages m WHERE m.id = :mid AND "
+           + _recipient_replied(has_conversations(con)))
+    return con.execute(sql, {"mid": message_id}).fetchone() is not None
+
+
 def candidate_query(conversations: bool, n_agents: int,
                     with_age: bool = True) -> str:
-    """SQL for never-attempted dispatchable messages. Named parameters:
-    :now, :min_created (only when with_age) and :a0.. for the recipients."""
+    """SQL for never-attempted, not-yet-answered dispatchable messages.
+    Named parameters: :now, :min_created (only when with_age) and :a0.. for
+    the recipients."""
     agents = ", ".join(f":a{i}" for i in range(n_agents))
     return (
         "SELECT m.id, m.recipient, m.created_at FROM messages m"
@@ -241,6 +271,7 @@ def candidate_query(conversations: bool, n_agents: int,
                        else _ROOT_ONLY)
         + "   AND NOT EXISTS (SELECT 1 FROM dispatch_attempts a"
           "                   WHERE a.message_id = m.id)"
+        + "   AND NOT " + _recipient_replied(conversations)
         + " ORDER BY m.id"
     )
 
@@ -249,9 +280,9 @@ def find_candidates(con: sqlite3.Connection, agents: Iterable[str],
                     now: float, max_age: float | None,
                     limit: int | None = None) -> list[tuple[int, str, float]]:
     """(id, recipient, created_at) of every never-attempted message that may
-    wake a worker, oldest first. max_age=None ignores the age bound (used
-    only by read-only reporting). The caller has checked that
-    dispatch_attempts exists."""
+    wake a worker and that its recipient has not answered yet, oldest first.
+    max_age=None ignores the age bound (used only by read-only reporting).
+    The caller has checked that dispatch_attempts exists."""
     agents = list(agents)
     if not agents:
         return []
