@@ -113,7 +113,7 @@ listener(action)   # action: status | progress | enable | disable
 Управление **собственным** фоновым слушателем текущего агента:
 
 - `status` — машинный `status()` слушателя (поля ниже).
-- `progress` — человекочитаемая однострочка, ровно та, что рисует statusline cclocal: `{"line": ...}`. Фолбэк `[<agent>] unknown`, вызов не падает никогда.
+- `progress` — человекочитаемая однострочка, ровно та, что рисует statusline cclocal: `{"line": ...}`. Фолбэк `[<agent>] unknown`, вызов не падает никогда. Отражает только lifecycle супервайзора (`received` → `supervising` → `finished` плюс исход последнего диспатча); внутренние этапы воркера не передаются и не планируются.
 - `enable` — снять disabled-маркер и идемпотентно запустить (дубликатов нет — flock; работает даже при `AGENT_BRIDGE_AUTO_LISTEN=0`).
 - `disable` — маркер-файл; слушатель берёт новых задач, дорабатывает текущего воркера и завершается. **Никакой PID никогда не убивается.**
 
@@ -130,7 +130,7 @@ listener.py run|status|progress|watch|enable|disable --agent kimi|claude
 ```
 
 - `run` — сам цикл слушателя (обычно запускается autostart'ом, не вручную): flock-синглтон → pidfile → progress-документ → раз в ~1 с скан bridge.db на одно диспатчабельное письмо → `on_message.py` → ожидание выхода супервайзора → снова скан. Истёкшие активные диалоги идемпотентно уходят в `needs_human`. `AGENT_BRIDGE_AUTO_LISTEN=0` запрещает autostart при загрузке MCP.
-- `status` — JSON `status()`: поля `agent, enabled, running, pid, message, auto, stage, progress, last`. Стадии: `stopped` (pid не подтверждён /proc), `unknown` (живой pid, но progress-документ отсутствует/не доверен), `idle`, `received`, `supervising`. `progress` — доверенный in-flight сегмент; `last` — исход последней диспетчеризации (показывается даже после краха). Доверие к документу — по равенству `listener_pid` pid из pidfile, проверенного через /proc.
+- `status` — JSON `status()`: поля `agent, enabled, running, pid, message, auto, stage, progress, last`. Стадии: `stopped` (pid не подтверждён /proc), `unknown` (живой pid, но progress-документ отсутствует/не доверен), `idle`, `received`, `supervising`. `progress` — доверенный in-flight сегмент; `last` — исход последней диспетчеризации (показывается даже после краха). Доступен только lifecycle супервайзора (`received` → `supervising` → `finished` плюс исход последнего диспатча в `last`); внутренние этапы воркера (вызовы инструментов, ход решения) не передаются и не планируются. Доверие к документу — по равенству `listener_pid` pid из pidfile, проверенного через /proc.
 - `progress` — одна строка, exit 0 всегда (для statusline).
 - `watch` — та же строка раз в 1 с; `--once` — один снимок.
 - `enable` / `disable` — см. MCP `listener`.

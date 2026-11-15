@@ -253,6 +253,8 @@ uv run python systemd/listener.py enable   --agent claude
 
 `listener pending` is a read-only backlog report: never-attempted messages that could wake a worker, split into `dispatchable` (the listener will take them) and `stale` (older than `dispatch_max_age_seconds`). It prints ids and ages only and never writes to the database.
 
+Progress reflects the supervisor lifecycle only: a message moves `received` → `supervising` → `finished`, and the `last` segment carries the outcome of the most recent dispatch. Worker-internal stages (tool calls, intermediate reasoning) are neither transmitted nor planned.
+
 From an MCP session the same human-readable snapshot is one call: `listener(action="progress")` returns `{"line": ...}` — the exact string the cclocal status line renders, e.g. `[claude] idle | last msg#43 sender=kimi result=succeeded in 21.5s rc=0`. It is ids, enums and numbers only, never task payload, and the call never raises.
 
 Progress files live in `systemd/runtime/<agent>.progress.json` and contain ids, enums and numbers only. Every document opens with `"format_version": 2`; a document without that marker comes from a listener written before the marker existed, and `status()` reports it as `legacy` instead of guessing its stage. The runtime directory is private and gitignored.
