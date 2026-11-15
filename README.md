@@ -326,6 +326,31 @@ Register it in `~/.openclaude/settings.json`:
 
 **Refresh behavior:** stock OpenClaude re-runs a status line command on TUI events only (assistant message, mode switches), so the line updates between events but does not tick on a timer; it also strips the unknown `refreshInterval` key instead of failing the file, so the snippet above is safe on a stock build. Periodic refresh requires a build with the `statusLine.refreshInterval` patch (proposed upstream; locally applied via `npm link` from a patched clone). The same output contract as everywhere else: ids, enums and numbers only, never task text.
 
+## Interactive bridge-agent mode
+
+An interactive window can consume bridge tasks itself — no manager loop, no headless dispatch. This ships as two **prompt commands** (markdown files, zero client patches: the client expands the command into a user message and the model runs the loop through the eight bridge MCP tools it is already connected with):
+
+- `commands/oc-bridge-agent.md` — OpenClaude, identity `local` (`/oc-bridge-agent [idle-minutes]`);
+- `commands/cc-bridge-agent.md` — Claude Code, identity `claude` (`/cc-bridge-agent [idle-minutes]`).
+
+Install by symlink so the repo stays the source of truth:
+
+```bash
+ln -s /path/to/agent-bridge/commands/oc-bridge-agent.md ~/.openclaude/commands/
+ln -s /path/to/agent-bridge/commands/cc-bridge-agent.md ~/.claude/commands/
+```
+
+A **shift** works like this: step 0 verifies the identity via `listener(status)`; the `oc` variant then **disables the `local` listener** (the headless dispatcher must not compete for messages — claim leases are respected by the scan and the supervisor, but winning the sub-second race every time is only guaranteed with the dispatcher off) and **re-enables it on exit**, including after a user interrupt. The `cc` variant never toggles the listener: the `claude` listener is disabled by design. The loop is the worker protocol verbatim: `receive_messages(wait_seconds=30)` → `claim_message(lease_seconds=3600)` → do the work → `send_message(kind="result", dedup_key="<prefix>:<id>:result")` → `mark_read`; a blocker answers `blocked: <reason>` and calls `release_message`. The shift exits after the idle limit (default 10 minutes, overridable by the argument) and reports per-message outcomes. An interactively consumed message leaves no `dispatch_attempts` row and is indistinguishable from a headless success in the DB.
+
+Trade-off and rules:
+
+- **No manager review.** The shift rules forbid destructive and external actions (git push, deploys, deletions beyond the task, sending data out) — the answer to those is `blocked` with a reason.
+- **One shift at a time** per agent; per-message disputes are settled by `claim_message`.
+- If the window dies mid-shift, the `local` listener stays disabled — recover with the `listener` MCP tool (`action="enable"`) or `uv run python systemd/listener.py enable --agent local`.
+- The shift calls only bridge MCP tools; allow `mcp__agent_bridge__*` in the client's project settings (or approve interactively) so the loop does not stall on permission prompts.
+
+`systemd/test_dispatcher.py` guards both files against drifting away from the dispatch protocol (`test_64_bridge_agent_command_contract`).
+
 ## Worker launchers
 
 The supervisor chooses a launcher by recipient:
