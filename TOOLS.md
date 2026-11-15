@@ -167,6 +167,8 @@ on_message.py [message_id] [--recover] [--auto]
 
 Промпт воркера: плейсхолдеры `{{WORKER_LABEL}}, {{PERMISSION_NOTE}}, {{MESSAGE_ID}}, {{SENDER}}, {{REPLY_TO}}, {{CREATED_AT}}, {{RESPONSE_DEADLINE}}, {{CONTEXT}}, {{TEXT}}, {{PROTOCOL}}`. Протокол требует ровно один терминальный исход (result+ack / follow-up task+ack / complete / needs_human); внешние и необратимые действия воркер за другого не авторизует.
 
+Интерактивный аналог — prompt-команды `commands/oc-bridge-agent.md` (OpenClaude, identity `local`) и `commands/cc-bridge-agent.md` (Claude Code, identity `claude`): окно само разбирает входящие задачи тем же протоколом, без headless-диспетчера и менеджера. Установка, механика смены (disable/enable слушателя у oc-варианта), трейд-оффы и восстановление — в README «Interactive bridge-agent mode». Дрейф файлов относительно протокола ловит `test_64_bridge_agent_command_contract`.
+
 ## 6. Состояние: БД и runtime
 
 `bridge.db` (SQLite, WAL, busy_timeout):
