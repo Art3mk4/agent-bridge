@@ -447,7 +447,7 @@ def _protocol_text(recipient: str, sender: str, conversation_id: int | None,
             f'   recipient="{peer}", reply_to={mid},\n'
             f"   conversation_id={cid}, kind=\"result\",\n"
             f'   dedup_key="{prefix}:{mid}:result",\n'
-            "   text=отчёт: что сделано, как проверено, что не удалось),\n"
+            f"   text={_REPORT_FORMAT}),\n"
             f"   затем mcp__agent_bridge__mark_read([{mid}]).\n"
             "4. Блокер или провал (отказ permission, нужен внешний или\n"
             "   необратимый шаг): тот же вызов, но\n"
@@ -467,8 +467,8 @@ def _protocol_text(recipient: str, sender: str, conversation_id: int | None,
         "3. Успех: отправь mcp__agent_bridge__send_message(\n"
         f'   recipient="{peer}", reply_to={mid},\n'
         f'   dedup_key="{prefix}:{mid}:result",\n'
-        "   text=итоговый отчёт: что сделано, как проверено, что не\n"
-        f"   удалось), затем mcp__agent_bridge__mark_read([{mid}]).\n"
+        f"   text={_REPORT_FORMAT}),\n"
+        f"   затем mcp__agent_bridge__mark_read([{mid}]).\n"
         "4. Блокер или провал (в том числе из-за отказа permission): \n"
         "   отправь mcp__agent_bridge__send_message(\n"
         f'   recipient="{peer}", reply_to={mid},\n'
@@ -481,6 +481,15 @@ def _protocol_text(recipient: str, sender: str, conversation_id: int | None,
         "   повторов: это единственная попытка, ошибка фиксируется\n"
         "   человеком.\n"
     )
+
+
+_REPORT_FORMAT = (
+    "отчёт строго по строкам, коротко — его читает ревьюер:\n"
+    "     done: <итог одной строкой>\n"
+    "     files: <изменённые файлы через запятую или none>\n"
+    "     check: <команда проверки> -> <итог одной строкой>\n"
+    "     not done: <что не удалось или none>"
+)
 
 
 def _build_prompt(template: str, row: tuple,

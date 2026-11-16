@@ -3131,6 +3131,165 @@ def test_71_agent_lists_agree(d: Path):
               f"{sorted(got)} != {sorted(want)}")
 
 
+# --------------------------------------------------------------- wait signal
+
+def _wait_cli(rt: Path, db: Path, *targets: str, timeout: float = 20.0,
+              agent: str = "kimi") -> subprocess.Popen:
+    cmd = listener_cmd("wait", agent, rt, db=db) + list(targets) \
+        + ["--timeout", str(timeout)]
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True,
+                            env=listener_env())
+
+
+def _wait_done(p: subprocess.Popen, limit: float = 30.0) -> tuple[int, dict]:
+    out, _err = p.communicate(timeout=limit)
+    return p.returncode, json.loads(out.strip().splitlines()[-1])
+
+
+def test_72_wait_signals_any_outcome(d: Path):
+    # The waiter (initiator kimi here) blocks until its worker reports or the
+    # supervisor says the dispatch failed — one event per outcome, ids and
+    # enums only, never the message text.
+    db = new_db(d)
+    rt = d / "runtime"
+    cid, mid = seed_conv(db)
+    p = _wait_cli(rt, db, "--conversation", str(cid))
+    time.sleep(1.5)
+    check("still waiting while the worker runs", p.poll() is None)
+    res = conv_msg(db, cid, "claude", "kimi", mid, "result",
+                   text=f"blocked: нет прав {SENTINEL}",
+                   dedup=f"cclocal:{mid}:result")
+    t0 = time.monotonic()
+    rc, doc = _wait_done(p)
+    check("event rc0", rc == 0, str(doc))
+    check("returns within ~2 s of the report", time.monotonic() - t0 < 4.0)
+    check("event names the report", doc.get("event") == "message"
+          and doc.get("message") == res and doc.get("conversation") == cid
+          and doc.get("kind") == "result", str(doc))
+    check("blocked outcome", doc.get("outcome") == "blocked", str(doc))
+    check("no payload in the signal", SENTINEL not in json.dumps(doc,
+                                                                  ensure_ascii=False))
+    # An event that is already there returns at once (the race between
+    # start_conversation and launching wait cannot lose a signal).
+    p = _wait_cli(rt, db, "--conversation", str(cid))
+    rc, doc = _wait_done(p)
+    check("unacked report returns immediately",
+          rc == 0 and doc.get("message") == res, str(doc))
+    # Acknowledged after review: the next wait waits again.
+    con = sqlite3.connect(db)
+    con.execute("UPDATE messages SET acknowledged=1 WHERE id=?", (res,))
+    con.commit()
+    con.close()
+    rc, doc = _wait_done(_wait_cli(rt, db, "--conversation", str(cid),
+                                   timeout=1.5))
+    check("nothing new -> timeout rc2",
+          rc == 2 and doc.get("event") == "timeout", str(doc))
+    # Successful report.
+    ok = conv_msg(db, cid, "claude", "kimi", mid, "result",
+                  text="done: готово\nfiles: a.py\ncheck: pytest -> ok\n"
+                       "not done: none", dedup=f"cclocal:{mid}:result2")
+    rc, doc = _wait_done(_wait_cli(rt, db, "--conversation", str(cid)))
+    check("done outcome", rc == 0 and doc.get("message") == ok
+          and doc.get("outcome") == "done", str(doc))
+    check("report still unread after wait",
+          q1(db, "SELECT acknowledged FROM messages WHERE id=?", ok)[0] == 0)
+    stamp = db.stat().st_mtime_ns
+    _wait_done(_wait_cli(rt, db, "--conversation", str(cid)))
+    _wait_done(_wait_cli(rt, db, "--conversation", str(cid), timeout=1.0))
+    check("wait never writes the database", db.stat().st_mtime_ns == stamp)
+
+
+def test_73_wait_supervisor_notice_and_closed_dialogue(d: Path):
+    # The signal must not depend on the worker: a crashed or hung worker
+    # never reports, but the supervisor's notice still ends the wait, with
+    # the attempt state as outcome. A dialogue closed without any message
+    # (expired, needs_human by hand) is an event too.
+    db = new_db(d)
+    rt = d / "runtime"
+    mid = seed(db)                                   # legacy root task
+    insert_attempt(db, mid, "timeout", None, time.time())
+    con = sqlite3.connect(db)
+    con.execute("INSERT INTO messages (sender, recipient, text, reply_to,"
+                " created_at, response_deadline, dedup_key, kind)"
+                " VALUES ('claude','kimi','служебное',?,?,?,?,'notice')",
+                (mid, time.time(), time.time() + 60,
+                 f"cclocal:{mid}:dispatch-error"))
+    con.commit()
+    con.close()
+    rc, doc = _wait_done(_wait_cli(rt, db, "--message", str(mid)))
+    check("notice ends the wait", rc == 0 and doc.get("kind") == "notice"
+          and doc.get("reply_to") == mid, str(doc))
+    check("outcome is the attempt state", doc.get("outcome") == "timeout",
+          str(doc))
+    cid, _root = seed_conv(db)
+    p = _wait_cli(rt, db, "--conversation", str(cid))
+    time.sleep(1.0)
+    con = sqlite3.connect(db)
+    con.execute("UPDATE conversations SET state='needs_human' WHERE id=?",
+                (cid,))
+    con.commit()
+    con.close()
+    rc, doc = _wait_done(p)
+    check("closed dialogue ends the wait",
+          rc == 0 and doc.get("event") == "conversation_closed"
+          and doc.get("state") == "needs_human", str(doc))
+
+
+def test_74_wait_several_targets_and_errors(d: Path):
+    # Several workers at once: one wait over all their dialogues, the first
+    # event wins and says which dialogue it is. Typos fail at once.
+    db = new_db(d)
+    rt = d / "runtime"
+    c1, m1 = seed_conv(db)
+    c2, m2 = seed_conv(db, recipient="local")
+    p = _wait_cli(rt, db, "--conversation", str(c1),
+                  "--conversation", str(c2))
+    time.sleep(1.0)
+    r2 = conv_msg(db, c2, "local", "kimi", m2, "result", text="done: ок",
+                  dedup=f"oclocal:{m2}:result")
+    rc, doc = _wait_done(p)
+    check("first finished dialogue wins", rc == 0
+          and doc.get("conversation") == c2 and doc.get("message") == r2
+          and doc.get("sender") == "local", str(doc))
+    rc, doc = _wait_done(_wait_cli(rt, db, "--conversation", "999999"))
+    check("unknown dialogue -> rc1 at once",
+          rc == 1 and doc.get("error") == "unknown_conversation", str(doc))
+    rc, doc = _wait_done(_wait_cli(rt, db, "--message", "999999"))
+    check("unknown message -> rc1",
+          rc == 1 and doc.get("error") == "unknown_message", str(doc))
+    rc, doc = _wait_done(_wait_cli(rt, d / "absent.db", "--message", "1"))
+    check("missing db -> rc1, not created",
+          rc == 1 and doc.get("error") == "no_database"
+          and not (d / "absent.db").exists(), str(doc))
+    rc, doc = _wait_done(_wait_cli(rt, db))
+    check("no target -> rc1", rc == 1 and doc.get("error") == "no_target",
+          str(doc))
+
+
+def test_75_compact_report_format_in_prompts(d: Path):
+    # The reviewer reads a few fixed lines instead of free prose: the
+    # headless protocol and both shift commands prescribe the same format.
+    db = new_db(d)
+    cfg = write_cfg(d, kimi=True)
+    mid = seed(db, sender="claude", recipient="kimi")
+    sup_run(d, db, cfg, mid, "--auto", agent="kimi")
+    prompt = (d / "runtime" / f"request_{mid}.txt").read_text(errors="replace")
+    for line in ("done: <итог одной строкой>", "files: <",
+                 "check: <команда проверки>", "not done: <"):
+        check(f"headless prompt prescribes '{line}'", line in prompt)
+    cid, cmid = seed_conv(db, initiator="claude", recipient="kimi")
+    sup_run(d, db, cfg, cmid, "--auto", agent="kimi")
+    cprompt = (d / "runtime" / f"request_{cmid}.txt").read_text(
+        errors="replace")
+    check("conversation task prompt uses the same format",
+          "done: <итог одной строкой>" in cprompt)
+    for name in ("cc-bridge-agent.md", "oc-bridge-agent.md"):
+        text = (ROOT / "commands" / name).read_text(encoding="utf-8")
+        check(f"{name} prescribes the compact report",
+              "done: <итог одной строкой>" in text and "not done:" in text)
+
+
 def main() -> int:
     print(f"tmp: {TMP}")
     tests = [
@@ -3199,6 +3358,10 @@ def main() -> int:
         test_69_enable_reports_running,
         test_70_mark_read_counts_only_new_acks,
         test_71_agent_lists_agree,
+        test_72_wait_signals_any_outcome,
+        test_73_wait_supervisor_notice_and_closed_dialogue,
+        test_74_wait_several_targets_and_errors,
+        test_75_compact_report_format_in_prompts,
     ]
     try:
         for fn in tests:
