@@ -124,15 +124,17 @@ listener(action)   # action: status | progress | enable | disable
 ## 2. CLI `systemd/listener.py`
 
 ```text
-listener.py run|status|progress|watch|enable|disable --agent kimi|claude
+listener.py run|status|progress|watch|pending|wait|enable|disable --agent kimi|claude|local
     [--db bridge.db] [--config systemd/config.json] [--runtime-dir systemd/runtime]
     [--on-message systemd/on_message.py] [--once]
+    [--conversation N ...] [--message N ...] [--timeout 3600]      # wait
 ```
 
 - `run` — сам цикл слушателя (обычно запускается autostart'ом, не вручную): flock-синглтон → pidfile → progress-документ → раз в ~1 с скан bridge.db на одно диспатчабельное письмо → `on_message.py` → ожидание выхода супервайзора → снова скан. Истёкшие активные диалоги идемпотентно уходят в `needs_human`. `AGENT_BRIDGE_AUTO_LISTEN=0` запрещает autostart при загрузке MCP.
 - `status` — JSON `status()`: поля `agent, enabled, running, pid, message, auto, stage, progress, last`. Стадии: `stopped` (pid не подтверждён /proc), `unknown` (живой pid, но progress-документ отсутствует/не доверен), `idle`, `received`, `supervising`. `progress` — доверенный in-flight сегмент; `last` — исход последней диспетчеризации (показывается даже после краха). Доступен только lifecycle супервайзора (`received` → `supervising` → `finished` плюс исход последнего диспатча в `last`); внутренние этапы воркера (вызовы инструментов, ход решения) не передаются и не планируются. Доверие к документу — по равенству `listener_pid` pid из pidfile, проверенного через /proc.
 - `progress` — одна строка, exit 0 всегда (для statusline).
 - `watch` — та же строка раз в 1 с; `--once` — один снимок.
+- `wait` — блокирующее ожидание события для инициатора вместо опроса `receive_messages`: первое **неподтверждённое** письмо агенту `--agent` в одном из диалогов `--conversation` (или ответ на `--message`), либо выход диалога из `active` без письма. Печатает одну JSON-строку: `event` (`message` / `conversation_closed` / `timeout` / `error`), `message`, `conversation`, `reply_to`, `sender`, `kind`, `outcome` (`done` / `blocked` для отчёта; состояние попытки `failed` / `timeout` / `uncertain` / `interrupted` для уведомления супервизора), `waited_s`. Коды выхода: 0 событие, 2 таймаут, 1 ошибка (неизвестный id сразу). Только чтение, без текста писем, только stdlib. Запускается фоновой командой (Claude Code: Bash `run_in_background`): модель ничего не тратит, пока команда не завершится.
 - `enable` / `disable` — см. MCP `listener`.
 
 Формат `runtime/<agent>.progress.json` (пишется атомарным replace, только ids/enums/numbers): `listener_pid, updated_at, current {message, stage, supervisor_pid, since}, last {message, stage, result, supervisor_rc, duration_s}`. В работе (P0-3): разведение `unknown` на `legacy` (старый код listener'а), `starting` (файл ещё не создан), `error` (ошибка чтения) + аддитивный `progress_state`.

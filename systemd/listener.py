@@ -54,6 +54,9 @@ CLI (emergency control without an MCP session):
                                                                 # human one-liner,
                                                                 # exit 0 always
     listener.py watch    --agent ... [--db --once]              # 1 s refresh
+    listener.py wait     --agent ... --conversation N | --message N
+                         [--timeout S] [--db]                   # block until
+                                                                # an event
     listener.py pending  --agent ... [--db --config]            # read-only
                                                                 # backlog JSON
 """
@@ -512,6 +515,135 @@ def _scan(db: str | Path, agent: str,
         con.close()
 
 
+# ---------------------------------------------------------------------- wait
+
+WAIT_POLL_SECONDS = 1.0
+WAIT_DEFAULT_TIMEOUT = 3600.0
+WAIT_RC_EVENT, WAIT_RC_ERROR, WAIT_RC_TIMEOUT = 0, 1, 2
+
+
+def _wait_outcome(con: sqlite3.Connection, row: tuple) -> str:
+    """Enum for one message addressed to the waiter — never its text.
+    done | blocked for a report, the attempt state (failed, timeout,
+    uncertain, interrupted) for a supervisor notice."""
+    _mid, _sender, text, reply_to, kind, dedup = row
+    if kind == "notice" or (dedup or "").endswith(":dispatch-error"):
+        if reply_to is not None and _schema_mod().has_dispatch_table(con):
+            st = con.execute("SELECT state FROM dispatch_attempts"
+                             " WHERE message_id = ?", (reply_to,)).fetchone()
+            if st and st[0]:
+                return str(st[0])
+        return "dispatch_error"
+    if kind == "task":
+        return "task"
+    return "blocked" if (text or "").lstrip().lower().startswith("blocked") \
+        else "done"
+
+
+def _wait_check(con: sqlite3.Connection, agent: str, convs: list[int],
+                msgs: list[int], conv_layer: bool) -> dict[str, Any] | None:
+    """One read-only pass: the first event for any target, or None."""
+    kind_col = "kind" if conv_layer else "NULL"
+    cols = f"id, sender, text, reply_to, {kind_col}, dedup_key"
+    for cid in convs:
+        row = con.execute(
+            f"SELECT {cols} FROM messages WHERE recipient = ?"
+            " AND acknowledged = 0 AND conversation_id = ?"
+            " ORDER BY id LIMIT 1", (agent, cid)).fetchone()
+        if row:
+            return {"event": "message", "message": row[0],
+                    "conversation": cid, "reply_to": row[3],
+                    "sender": row[1], "kind": row[4],
+                    "outcome": _wait_outcome(con, row)}
+        st = con.execute("SELECT state FROM conversations WHERE id = ?",
+                         (cid,)).fetchone()
+        if st and st[0] != "active":
+            return {"event": "conversation_closed", "conversation": cid,
+                    "state": st[0]}
+    for mid in msgs:
+        row = con.execute(
+            f"SELECT {cols} FROM messages WHERE recipient = ?"
+            " AND acknowledged = 0 AND reply_to = ?"
+            " ORDER BY id LIMIT 1", (agent, mid)).fetchone()
+        if row:
+            return {"event": "message", "message": row[0],
+                    "conversation": None, "reply_to": mid,
+                    "sender": row[1], "kind": row[4],
+                    "outcome": _wait_outcome(con, row)}
+    return None
+
+
+def wait(agent: str, db: str | Path, conversations: list[int],
+         messages: list[int], timeout: float = WAIT_DEFAULT_TIMEOUT,
+         poll: float = WAIT_POLL_SECONDS) -> tuple[int, dict[str, Any]]:
+    """Block until something the waiter must look at arrives, then return.
+
+    The cheap way for an interactive session to wait for its workers: run
+    this as a background command and do nothing until it exits, instead of
+    calling receive_messages every 30 s (each call is a full model turn).
+
+    An event is the first UNACKNOWLEDGED message addressed to `agent` that
+    belongs to one of the conversations, or replies to one of the messages:
+    a worker's report (outcome done | blocked) or the supervisor's
+    payload-free notice (outcome = the attempt state: failed, timeout,
+    uncertain, interrupted). That signal does not depend on the worker
+    behaving — the supervisor sends the notice when the worker crashes or
+    hangs. A conversation that leaves 'active' without a message (expired,
+    closed by hand) is an event too. Several targets: the first one wins.
+
+    Read-only, ids and enums only — never message text. Returns
+    (rc, document): rc 0 event, 2 timeout, 1 error (unknown id, no db).
+    """
+    started = time.monotonic()
+    convs, msgs = sorted(set(conversations)), sorted(set(messages))
+    base: dict[str, Any] = {"agent": agent}
+    if not convs and not msgs:
+        return WAIT_RC_ERROR, {**base, "event": "error",
+                               "error": "no_target"}
+    sm = _schema_mod()
+    while True:
+        try:
+            con = sm.connect_readonly(db, timeout=2.0)
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            return WAIT_RC_ERROR, {**base, "event": "error",
+                                   "error": type(exc).__name__}
+        if con is None:
+            return WAIT_RC_ERROR, {**base, "event": "error",
+                                   "error": "no_database"}
+        try:
+            conv_layer = sm.has_conversations(con)
+            if convs and not conv_layer:
+                return WAIT_RC_ERROR, {**base, "event": "error",
+                                       "error": "no_conversations"}
+            # A typo must fail now, not after an hour of silence.
+            for cid in convs:
+                if con.execute("SELECT 1 FROM conversations WHERE id = ?",
+                               (cid,)).fetchone() is None:
+                    return WAIT_RC_ERROR, {**base, "event": "error",
+                                           "error": "unknown_conversation",
+                                           "conversation": cid}
+            for mid in msgs:
+                if con.execute("SELECT 1 FROM messages WHERE id = ?",
+                               (mid,)).fetchone() is None:
+                    return WAIT_RC_ERROR, {**base, "event": "error",
+                                           "error": "unknown_message",
+                                           "message": mid}
+            ev = _wait_check(con, agent, convs, msgs, conv_layer)
+        except sqlite3.Error:
+            # A busy writer is normal; anything persistent shows up as the
+            # timeout, never as a crash of the waiting command.
+            ev = None
+        finally:
+            con.close()
+        waited = round(time.monotonic() - started, 1)
+        if ev is not None:
+            return WAIT_RC_EVENT, {**base, **ev, "waited_s": waited}
+        if waited >= timeout:
+            return WAIT_RC_TIMEOUT, {**base, "event": "timeout",
+                                     "waited_s": waited}
+        time.sleep(poll)
+
+
 def pending(agent: str, config: str, db: str | Path) -> dict[str, Any]:
     """Read-only backlog report for one agent: never-attempted messages that
     could wake a worker, split into `dispatchable` (within
@@ -935,7 +1067,7 @@ def disable(agent: str, config: str, runtime_dir: str) -> dict[str, Any]:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("action", choices=["run", "status", "enable", "disable",
-                                      "progress", "watch", "pending"])
+                                      "progress", "watch", "pending", "wait"])
     p.add_argument("--agent", required=True, choices=sorted(AGENTS))
     p.add_argument("--db", default=str(DEFAULT_DB))
     p.add_argument("--config", default=str(DEFAULT_CONFIG))
@@ -945,6 +1077,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="with watch: print one snapshot and exit (progress"
                         " already prints exactly one, so a statusline can"
                         " call either; it is accepted here for symmetry)")
+    p.add_argument("--conversation", type=int, action="append", default=[],
+                   help="with wait: conversation id to wait on (repeatable;"
+                        " the first event of any of them ends the wait)")
+    p.add_argument("--message", type=int, action="append", default=[],
+                   help="with wait: legacy root task id whose reply to wait"
+                        " for (repeatable)")
+    p.add_argument("--timeout", type=float, default=WAIT_DEFAULT_TIMEOUT,
+                   help="with wait: seconds before giving up (exit 2)")
     return p.parse_args(argv)
 
 
@@ -982,6 +1122,15 @@ def main(argv: list[str] | None = None) -> int:
     elif a.action == "pending":
         print(json.dumps(pending(a.agent, a.config, a.db), ensure_ascii=False),
               flush=True)
+    elif a.action == "wait":
+        try:
+            rc, doc = wait(a.agent, a.db, a.conversation, a.message,
+                           timeout=a.timeout)
+        except KeyboardInterrupt:
+            rc, doc = WAIT_RC_TIMEOUT, {"agent": a.agent,
+                                        "event": "interrupted"}
+        print(json.dumps(doc, ensure_ascii=False), flush=True)
+        return rc
     elif a.action == "enable":
         print(json.dumps(enable(a.agent, a.db, a.config, rt, a.on_message),
                          ensure_ascii=False), flush=True)

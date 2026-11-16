@@ -41,7 +41,9 @@ disable-model-invocation: true
    recipient=<sender>, reply_to=<id>,
    conversation_id=<cid> и kind="result" — только если сообщение в диалоге,
    dedup_key="oclocal:<id>:result",
-   text=отчёт: что сделано, как проверено, что не удалось), затем
+   text=отчёт строками «done: <итог одной строкой>», «files: <файлы
+   или none>», «check: <команда> -> <итог>», «not done: <что не удалось
+   или none>»), затем
    mcp__agent_bridge__mark_read([<id>]).
 4. Блокер или провал (в том числе из-за отказа permission): тот же
    send_message, но text="blocked: <конкретная причина>", затем

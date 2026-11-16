@@ -251,6 +251,27 @@ uv run python systemd/listener.py enable   --agent claude
 - `progress`: the currently trusted lifecycle record;
 - `last`: the previous dispatch outcome, including duration and exit code where available.
 
+### Waiting for a result without polling
+
+An interactive session that delegated work should not call `receive_messages` every 30 seconds: each call is a full model turn. `listener wait` blocks instead, and the session runs it as a **background command** (Claude Code: Bash with `run_in_background`), then does nothing until the command exits — Claude Code delivers a completion notification on exit.
+
+```bash
+python3 "$AGENT_BRIDGE_DIR/systemd/listener.py" wait --agent claude --conversation 12 --timeout 3600
+python3 "$AGENT_BRIDGE_DIR/systemd/listener.py" wait --agent claude --conversation 12 --conversation 13   # several workers: first event wins
+python3 "$AGENT_BRIDGE_DIR/systemd/listener.py" wait --agent claude --message 57                          # legacy root task
+```
+
+It prints exactly one JSON line and exits:
+
+- `{"event":"message","message":58,"conversation":12,"reply_to":57,"sender":"local","kind":"result","outcome":"done"|"blocked"}` — the worker reported;
+- `"kind":"notice","outcome":"failed"|"timeout"|"uncertain"|"interrupted"` — the worker never reported, the supervisor did (the signal does not depend on the worker behaving);
+- `{"event":"conversation_closed","state":"needs_human"|...}` — the dialogue left `active` without a message (expired, closed by hand);
+- exit 2 `{"event":"timeout"}`; exit 1 `{"event":"error","error":"unknown_conversation"|...}` at once for a mistyped id.
+
+An event is the first **unacknowledged** message to the waiter in the target, so a report that arrived before `wait` started is returned immediately, and after `mark_read` the next `wait` waits again. Read-only, ids and enums only, never message text. Only `python3` is needed (stdlib), so it runs from any project directory.
+
+Reports themselves are compact: the protocol asks every worker for four lines — `done: <one-line outcome>` (or `blocked: <reason>`), `files: …`, `check: <command> -> <result>`, `not done: …` — so the reviewer reads a few lines before verifying the diff and the tests itself.
+
 `listener pending` is a read-only backlog report: never-attempted messages that could wake a worker, split into `dispatchable` (the listener will take them) and `stale` (older than `dispatch_max_age_seconds`). It prints ids and ages only and never writes to the database.
 
 Progress reflects the supervisor lifecycle only: a message moves `received` → `supervising` → `finished`, and the `last` segment carries the outcome of the most recent dispatch. Worker-internal stages (tool calls, intermediate reasoning) are neither transmitted nor planned.
@@ -419,7 +440,7 @@ uv run python systemd/test_dispatcher.py
 
 `test_bridge.py` is a destructive end-to-end test that deletes and recreates `bridge.db`. Run it only in a disposable copy of the project before live traffic, never against a database containing real messages.
 
-Current safe suite: 65 dispatcher tests, including a deterministic stress test for concurrent supervisors against a non-WAL database held by a writer.
+Current safe suite: 69 dispatcher tests, including a deterministic stress test for concurrent supervisors against a non-WAL database held by a writer.
 
 `systemd/schema.py` is the shared core of the dispatcher: DDL, the connection recipe, the `config.json` reader and the single definition of the dispatch set used by both the listener and `--recover`. Change dispatch rules there, not in the callers.
 
