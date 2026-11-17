@@ -3290,6 +3290,233 @@ def test_75_compact_report_format_in_prompts(d: Path):
               "done: <итог одной строкой>" in text and "not done:" in text)
 
 
+# -------------------------------------------------------------- manager mode
+
+MANAGER_PY = HERE / "manager_mode.py"
+
+
+def _mm_env(d: Path, **extra: str) -> dict:
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("AGENT_BRIDGE_WORKER", "CLAUDE_CODE_USE_OPENAI")}
+    env["AGENT_BRIDGE_MANAGER_DIR"] = str(d / "mm-state")
+    env.update(extra)
+    return env
+
+
+def _mm(d: Path, *args: str, stdin: str | None = None,
+        **extra: str) -> subprocess.CompletedProcess:
+    return subprocess.run([PY, str(MANAGER_PY), *args], input=stdin,
+                          capture_output=True, text=True, timeout=30,
+                          env=_mm_env(d, **extra))
+
+
+def _mm_hook(d: Path, event: dict, **extra: str) -> subprocess.CompletedProcess:
+    return _mm(d, "hook", stdin=json.dumps(event), **extra)
+
+
+def _mm_project(d: Path, name: str = "proj") -> Path:
+    proj = d / name
+    (proj / ".git" / "info").mkdir(parents=True)
+    (proj / "src").mkdir()
+    return proj
+
+
+def test_76_manager_mode_guard(d: Path):
+    # Off: every hook is a no-op. On: file edits and obvious Bash writes in
+    # the project are blocked with a reason for the model; reading, git,
+    # waiting and .agent-tasks specs pass; workers and other projects are
+    # never touched. The switch takes effect on the next hook call.
+    proj = _mm_project(d)
+    other = _mm_project(d, "other")
+    sub = str(proj / "src")
+    edit = {"hook_event_name": "PreToolUse", "tool_name": "Edit",
+            "cwd": sub, "tool_input": {"file_path": f"{proj}/src/app.py"}}
+    r = _mm_hook(d, edit)
+    check("mode off: edit allowed", r.returncode == 0 and not r.stderr,
+          r.stderr)
+    r = _mm(d, "on", "--project", sub)
+    doc = json.loads(r.stdout)
+    check("on from a subdirectory keys the git root",
+          r.returncode == 0 and doc["project"] == str(proj.resolve()), r.stdout)
+    st_dir = d / "mm-state"
+    files = list(st_dir.glob("*.json"))
+    check("state file 0600 in a 0700 dir", len(files) == 1
+          and files[0].stat().st_mode & 0o777 == 0o600
+          and st_dir.stat().st_mode & 0o777 == 0o700)
+    r = _mm_hook(d, edit)
+    check("mode on: edit blocked with exit 2", r.returncode == 2
+          and "режимом Manager" in r.stderr and "start_conversation" in r.stderr,
+          r.stderr)
+
+    def pre(tool: str, inp: dict, cwd: str = sub, **extra: str) -> int:
+        return _mm_hook(d, {"hook_event_name": "PreToolUse",
+                            "tool_name": tool, "cwd": cwd,
+                            "tool_input": inp}, **extra).returncode
+
+    check("spec in .agent-tasks allowed",
+          pre("Write", {"file_path": f"{proj}/.agent-tasks/s1.md"}) == 0)
+    check("Read allowed", pre("Read", {"file_path": f"{proj}/src/app.py"}) == 0)
+    for cmd in ("git diff --stat 2>&1 | head -50",
+                "git commit -F - <<'EOF'\nfix: a -> b\nbody > text\nEOF",
+                f'python3 "{ROOT}/systemd/listener.py" wait --agent claude'
+                " --conversation 3 --timeout 3600",
+                "echo '.agent-tasks/' >> .git/info/exclude",
+                "uv run pytest > /dev/null 2>&1"):
+        check(f"bash allowed: {cmd[:40]!r}", pre("Bash", {"command": cmd}) == 0)
+    for cmd in ("sed -i 's/a/b/' src/app.py", "echo x >> src/app.py",
+                "cat > src/app.py <<'EOF'\nx\nEOF", "git apply fix.patch",
+                "echo x | tee src/a.py"):
+        check(f"bash blocked: {cmd[:40]!r}", pre("Bash", {"command": cmd}) == 2)
+    check("other project untouched",
+          pre("Edit", {"file_path": f"{other}/a.py"}, cwd=str(other)) == 0)
+    check("headless worker never blocked",
+          pre("Edit", {"file_path": f"{proj}/a.py"},
+              AGENT_BRIDGE_WORKER="1") == 0)
+    check("interactive OpenClaude shift never blocked",
+          pre("Edit", {"file_path": f"{proj}/a.py"},
+              CLAUDE_CODE_USE_OPENAI="1") == 0)
+    r = _mm(d, "hook", stdin="not json")
+    check("garbage hook input fails open", r.returncode == 0)
+    r = _mm_hook(d, {"hook_event_name": "UserPromptSubmit", "cwd": sub,
+                     "prompt": "x"})
+    check("reminder on every user turn", r.returncode == 0
+          and "режим Manager" in r.stdout
+          and f'{ROOT}/systemd/listener.py' in r.stdout
+          and len(r.stdout) < 800, r.stdout)
+    r = _mm_hook(d, {"hook_event_name": "SessionStart", "cwd": sub,
+                     "source": "compact"})
+    check("full role after start/clear/compact", r.returncode == 0
+          and str(proj.resolve()) in r.stdout
+          and "{AGENT_BRIDGE_DIR}" not in r.stdout
+          and "{PROJECT}" not in r.stdout
+          and "не пишешь код" in r.stdout, r.stdout[:300])
+    r = _mm(d, "off", "--project", str(proj))
+    check("off", json.loads(r.stdout)["was_enabled"] is True)
+    check("after off: edit allowed again", _mm_hook(d, edit).returncode == 0)
+    r = _mm_hook(d, {"hook_event_name": "UserPromptSubmit", "cwd": sub})
+    check("after off: no reminder", r.stdout.strip() == "", r.stdout)
+
+
+def test_77_manager_install_merges_settings(d: Path):
+    # install merges three hook entries into an existing settings file,
+    # keeps every other key and hook, backs the old file up, is idempotent;
+    # uninstall removes only ours.
+    settings = d / "claude" / "settings.json"
+    settings.parent.mkdir()
+    foreign = {"matcher": "Bash", "hooks": [{"type": "command",
+                                             "command": "echo other"}]}
+    settings.write_text(json.dumps({"model": "opus", "permissions":
+                                    {"allow": ["Read"]},
+                                    "hooks": {"PreToolUse": [foreign]}}),
+                        encoding="utf-8")
+    r = _mm(d, "install", "--settings", str(settings))
+    res = json.loads(r.stdout)
+    check("install changed + backup", res["changed"] and res["backup"]
+          and Path(res["backup"]).exists() and res["installed"], r.stdout)
+    doc = json.loads(settings.read_text())
+    check("other keys kept", doc["model"] == "opus"
+          and doc["permissions"] == {"allow": ["Read"]})
+    pre = doc["hooks"]["PreToolUse"]
+    check("foreign hook kept", foreign in pre, str(pre))
+    ours = [e for e in pre if "manager_mode.py" in json.dumps(e)]
+    check("our guard with the edit/bash matcher", len(ours) == 1
+          and ours[0]["matcher"] == "Edit|Write|MultiEdit|NotebookEdit|Bash")
+    for ev in ("UserPromptSubmit", "SessionStart"):
+        check(f"{ev} hook present", any("manager_mode.py" in json.dumps(e)
+                                        for e in doc["hooks"].get(ev, [])))
+    r = _mm(d, "install", "--settings", str(settings))
+    check("idempotent", json.loads(r.stdout)["changed"] is False, r.stdout)
+    r = _mm(d, "status", "--settings", str(settings))
+    check("status sees the hooks", json.loads(r.stdout)["hooks_installed"])
+    r = _mm(d, "uninstall", "--settings", str(settings))
+    doc = json.loads(settings.read_text())
+    check("uninstall keeps only foreign hooks",
+          doc.get("hooks") == {"PreToolUse": [foreign]}, json.dumps(doc))
+    fresh = d / "fresh" / "settings.json"
+    r = _mm(d, "install", "--settings", str(fresh))
+    check("install creates a missing settings file",
+          r.returncode == 0 and json.loads(fresh.read_text())["hooks"],
+          r.stderr[-200:])
+
+
+def test_78_manager_mcp_tool_and_prompt(d: Path):
+    # The MCP side: `on` returns the role text into the context at once,
+    # there is no `off` for the model, only the claude identity may use it,
+    # and the slash-command prompt is registered.
+    import asyncio
+    proj = _mm_project(d)
+    server = import_server(d / "errors.log")
+    old_env = {k: os.environ.get(k) for k in
+               ("AGENT_ID", "AGENT_BRIDGE_MANAGER_DIR", "CLAUDE_CONFIG_DIR")}
+    os.environ.update(AGENT_ID="claude",
+                      AGENT_BRIDGE_MANAGER_DIR=str(d / "mm-state"),
+                      CLAUDE_CONFIG_DIR=str(d / "cfg"))
+    server._MANAGER_MOD = None
+    try:
+        res = server.manager("on", project=str(proj / "src"))
+        check("on -> enabled for the git root", res["enabled"]
+              and res["project"] == str(proj.resolve()), str(res)[:200])
+        check("role text returned", str(proj.resolve()) in res["role"]
+              and "{AGENT_BRIDGE_DIR}" not in res["role"])
+        check("note when hooks are missing", "install" in res.get("note", ""))
+        st = server.manager("status", project=str(proj))
+        check("status", st["enabled"] and st["hooks_installed"] is False,
+              str(st))
+        for bad in ("off", "disable"):
+            try:
+                server.manager(bad, project=str(proj))
+                check(f"{bad} refused", False)
+            except ValueError as exc:
+                check(f"{bad} refused for the model", "human" in str(exc))
+        os.environ["AGENT_ID"] = "local"
+        try:
+            server.manager("on", project=str(proj))
+            check("worker identity refused", False)
+        except ValueError:
+            check("worker identity refused", True)
+        prompts = asyncio.run(server.mcp.list_prompts())
+        names = [getattr(p, "name", None) for p in prompts]
+        check("prompt 'manager' registered", "manager" in names, str(names))
+        text = server.manager_prompt(str(proj))
+        check("prompt asks to call the tool",
+              'mcp__agent_bridge__manager(action="on"' in text, text)
+    finally:
+        server._MANAGER_MOD = None
+        for k, v in old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_79_launchers_mark_workers(d: Path):
+    # Manager-mode hooks must never block the worker that writes the code.
+    fake = d / "fake_bin.sh"
+    fake.write_text('#!/bin/sh\necho "worker=$AGENT_BRIDGE_WORKER"\n',
+                    encoding="utf-8")
+    fake.chmod(0o755)
+    envf = d / "aliases"
+    cfg_dir = d / "cfgdir"
+    envf.write_text("LOCAL_CLAUDE_BASE_URL=http://127.0.0.1:1\n"
+                    "LOCAL_CLAUDE_MODEL=m\n"
+                    f"LOCAL_CLAUDE_CONFIG_DIR={cfg_dir}\n", encoding="utf-8")
+    base = {k: v for k, v in os.environ.items()
+            if not k.startswith(("LOCAL_CLAUDE_", "LOCAL_API_"))
+            and k != "AGENT_BRIDGE_WORKER"}
+    for script, extra in (
+            ("oclocal_headless.sh", {"OCLOCAL_ENV_FILE": str(envf),
+                                     "OCLOCAL_OPENCLAUDE_BIN": str(fake)}),
+            ("cclocal_headless.sh", {"CCLOCAL_ENV_FILE": str(envf),
+                                     "CCLOCAL_CLAUDE_BIN": str(fake)})):
+        r = subprocess.run(["bash", str(HERE / script)], capture_output=True,
+                           text=True, timeout=30, env={**base, **extra},
+                           stdin=subprocess.DEVNULL)
+        check(f"{script} exports AGENT_BRIDGE_WORKER=1",
+              "worker=1" in r.stdout, r.stdout + r.stderr[-200:])
+    check("kimi launcher exports the marker", "export AGENT_BRIDGE_WORKER=1"
+          in (HERE / "kimi_headless.sh").read_text(encoding="utf-8"))
+
+
 def main() -> int:
     print(f"tmp: {TMP}")
     tests = [
@@ -3362,6 +3589,10 @@ def main() -> int:
         test_73_wait_supervisor_notice_and_closed_dialogue,
         test_74_wait_several_targets_and_errors,
         test_75_compact_report_format_in_prompts,
+        test_76_manager_mode_guard,
+        test_77_manager_install_merges_settings,
+        test_78_manager_mcp_tool_and_prompt,
+        test_79_launchers_mark_workers,
     ]
     try:
         for fn in tests:

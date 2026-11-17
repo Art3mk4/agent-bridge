@@ -22,7 +22,7 @@ OpenClaude сессия ── MCP stdio ──► server.py (AGENT_ID=local) �
 
 ---
 
-## 1. MCP-инструменты (8)
+## 1. MCP-инструменты (9) и промпт
 
 Общие константы-ограничения (`server.py`): long-poll ≤ 30 с, `response_timeout_seconds` 1..3600 (дефолт 300), lease 30..3600, conversation: `max_turns` 2..20 (дефолт 6), TTL 60..86400 с (дефолт 14400), виды сообщений диалога `task | result | notice`. Ошибки вызывают `ValueError` (MCP вернёт `is_error=true`).
 
@@ -119,6 +119,20 @@ listener(action)   # action: status | progress | enable | disable
 
 Фактическая диспетчеризация по-прежнему регулируется гейтом `auto.<agent>` в `systemd/config.json`.
 
+### manager
+
+```text
+manager(action="status", project=None)   # action: on | status
+```
+
+Только для identity `claude`. Режим Manager для проекта (ключ — корень git; `project` по умолчанию — рабочий каталог MCP-сервера):
+
+- `on` — включить и вернуть `role` (текст роли из `commands/manager-role.md` с подставленными путями моста и проекта); при неустановленных хуках добавляется `note` с тем, что сказать человеку.
+- `status` — `{project, enabled, hooks_installed}`.
+- `off` нет: выключает только человек (`systemd/manager_mode.py off`).
+
+MCP-промпт `manager` (в Claude Code — `/mcp__agent_bridge__manager`, аргумент `project`) просит модель вызвать `manager(action="on")` и держаться роли.
+
 ---
 
 ## 2. CLI `systemd/listener.py`
@@ -138,6 +152,18 @@ listener.py run|status|progress|watch|pending|wait|enable|disable --agent kimi|c
 - `enable` / `disable` — см. MCP `listener`.
 
 Формат `runtime/<agent>.progress.json` (пишется атомарным replace, только ids/enums/numbers): `listener_pid, updated_at, current {message, stage, supervisor_pid, since}, last {message, stage, result, supervisor_rc, duration_s}`. В работе (P0-3): разведение `unknown` на `legacy` (старый код listener'а), `starting` (файл ещё не создан), `error` (ошибка чтения) + аддитивный `progress_state`.
+
+## 2a. CLI `systemd/manager_mode.py` — режим Manager
+
+```text
+manager_mode.py on|off|status|list|role [--project P]
+manager_mode.py install|uninstall [--settings ~/.claude/settings.json]
+manager_mode.py hook            # точка входа хуков Claude Code (JSON на stdin)
+```
+
+- Состояние — `systemd/runtime/manager/<sha256(корня)[:16]>.json` (0600, каталог 0700): `{project, enabled_at, by}`. Переопределение каталога — `AGENT_BRIDGE_MANAGER_DIR`.
+- `install` добавляет в settings.json три хука с командой `python3 "<мост>/systemd/manager_mode.py" hook`: `PreToolUse` (matcher `Edit|Write|MultiEdit|NotebookEdit|Bash`), `UserPromptSubmit`, `SessionStart`. Остальное сохраняется, старый файл — `settings.json.bak-<время>`; повторный вызов ничего не меняет. `uninstall` убирает только свои записи.
+- `hook`: вне проекта с включённым режимом и для воркеров (`AGENT_BRIDGE_WORKER=1`, `CLAUDE_CODE_USE_OPENAI=1`) — ничего не делает. Иначе: PreToolUse — exit 2 с причиной для модели на правку файлов внутри проекта (кроме `.agent-tasks/` и `.git/info/exclude`) и на очевидную запись через Bash; UserPromptSubmit — короткое напоминание роли; SessionStart — полный текст роли. Нераспознанный ввод пропускается (fail-open).
 
 ## 3. CLI `systemd/on_message.py` — one-shot supervisor
 

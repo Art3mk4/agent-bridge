@@ -27,4 +27,7 @@ KIMI_BIN="${KIMI_BIN:-$HOME/.kimi-code/bin/kimi}"
 # Project-scoped MCP (.kimi-code/mcp.json) only loads in a trusted workspace.
 export KIMI_CODE_TRUST_WORKSPACE="${KIMI_CODE_TRUST_WORKSPACE:-1}"
 
+# Marks a bridge worker: manager-mode hooks (systemd/manager_mode.py) never
+# block it, even in a project where the main model is in manager mode.
+export AGENT_BRIDGE_WORKER=1
 exec "$KIMI_BIN" "$@"

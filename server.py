@@ -32,6 +32,7 @@ ERROR_LOG_PATH = Path(__file__).resolve().parent / "errors.log"
 SYSTEMD_DIR = Path(__file__).resolve().parent / "systemd"
 ON_MESSAGE = SYSTEMD_DIR / "on_message.py"
 LISTENER_PY = SYSTEMD_DIR / "listener.py"
+MANAGER_PY = SYSTEMD_DIR / "manager_mode.py"
 DISPATCH_CONFIG_PATH = SYSTEMD_DIR / "config.json"
 RUNTIME_DIR = SYSTEMD_DIR / "runtime"
 SCHEMA_PY = SYSTEMD_DIR / "schema.py"
@@ -1054,6 +1055,72 @@ def mark_read(message_ids: list[int]) -> dict[str, Any]:
         return {"acknowledged": cur.rowcount}
     finally:
         con.close()
+
+
+# ------------------------------------------------------------------ manager
+
+_MANAGER_MOD: Any = None
+
+
+def _get_manager() -> Any:
+    """systemd/manager_mode.py, loaded once by path like the listener."""
+    global _MANAGER_MOD
+    if _MANAGER_MOD is None:
+        _MANAGER_MOD = _load_by_path("agent_bridge_manager", MANAGER_PY)
+    return _MANAGER_MOD
+
+
+@mcp.tool()
+@_logged
+def manager(action: str = "status", project: str | None = None) -> dict[str, Any]:
+    """Manager mode for the interactive `claude` session: you plan, delegate
+    to the local worker and review — you do not write code.
+
+    action="on" turns the mode on for the project (its git root; pass your
+    project path, default: this server's working directory) and returns the
+    role text: follow it for the rest of the session. action="status" reports
+    the mode and whether the enforcement hooks are installed. There is no
+    "off": only a human turns the mode off (systemd/manager_mode.py off).
+    """
+    if _agent() != "claude":
+        raise ValueError("manager mode is for the interactive claude session")
+    act = str(action)
+    if act not in ("on", "status"):
+        raise ValueError("action must be 'on' or 'status'; only a human turns"
+                         " manager mode off (systemd/manager_mode.py off)")
+    mm = _get_manager()
+    root = mm.project_root(project)
+    hooks = mm.hooks_installed(mm.settings_path())
+    if act == "status":
+        doc = mm.state(root)
+        return {"project": str(root), "enabled": doc is not None,
+                "hooks_installed": hooks}
+    mm.enable(root, by="mcp")
+    out: dict[str, Any] = {"project": str(root), "enabled": True,
+                           "hooks_installed": hooks, "role": mm.role_text(root)}
+    if not hooks:
+        out["note"] = (
+            "Хуки режима не установлены: запрет правок и напоминания пока не"
+            " действуют, держись роли сам. Человеку: python3"
+            f" \"{MANAGER_PY}\" install (один раз, работает со следующего"
+            " запуска); в текущей сессии — /permissions → Deny: Edit, Write,"
+            " NotebookEdit.")
+    return out
+
+
+@mcp.prompt(name="manager", title="Режим Manager",
+            description="Главная модель планирует, ставит задачи локальному"
+                        " исполнителю и проверяет результат; код не пишет.")
+def manager_prompt(project: str = "") -> str:
+    target = f'project="{project}"' if project else \
+        "project=<абсолютный путь к корню текущего проекта>"
+    return (
+        "Включи режим Manager: вызови mcp__agent_bridge__manager("
+        f'action="on", {target}) и с этого момента до конца сессии действуй'
+        " строго по роли из поля role ответа. Если в ответе есть note —"
+        " передай её мне. Подтверди одной строкой и начни с проверки"
+        " listener(action=\"status\")."
+    )
 
 
 def main() -> None:
