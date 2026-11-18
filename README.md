@@ -164,6 +164,9 @@ An interactive OpenClaude session must never load the project `.mcp.json` used b
 | `start_conversation` | Create a bounded dialogue and send its root `task`. |
 | `conversation` | Inspect, complete, cancel or escalate a dialogue. |
 | `listener` | Enable, disable or inspect the current agent's background listener; `action="progress"` returns the same one-line progress string as the cclocal status line. |
+| `manager` | `claude` only: turn [manager mode](#manager-mode) on for a project (`action="on"`, returns the role text) or inspect it (`action="status"`). There is no `off` for the model. |
+
+The server also exposes one MCP prompt, `manager`, which Claude Code shows as the slash command `/mcp__agent_bridge__manager`.
 
 ## Basic exchange
 
@@ -210,7 +213,39 @@ manager (claude)                       worker (local)
   └─ complete / needs_human
 ```
 
-Only the manager opens conversations and only the manager decides the terminal action after a result. A `blocked` report is a normal review input, not a dispatch failure: the manager either narrows the task to what the allowlist actually permits or does the denied step itself in the interactive session.
+Only the manager opens conversations and only the manager decides the terminal action after a result. A `blocked` report is a normal review input, not a dispatch failure: the manager either narrows the task to what the allowlist actually permits or does the denied step itself in the interactive session — unless it is in manager mode, where code changes are left to the worker or to the human.
+
+### Manager mode
+
+Manager mode keeps the interactive `claude` session in the manager role for the whole session: it plans, writes task specs, delegates to `local`, waits for the signal and reviews — it does not write code. It is per project (keyed by the git root) and can be switched on **in a running session**.
+
+One-time setup — install the hooks into your Claude Code user settings (`$CLAUDE_CONFIG_DIR` or `~/.claude`, `settings.json`; other keys and hooks are kept, the old file is backed up):
+
+```bash
+python3 systemd/manager_mode.py install
+```
+
+Claude Code snapshots hooks when a session starts, so they work from the next start — once. After that the mode is switched without any restart, because every hook call reads the per-project flag in `systemd/runtime/manager/`.
+
+Turning it on, in any session:
+
+- `/mcp__agent_bridge__manager` (the MCP prompt), or ask the model to call `manager(action="on", project="<path>")`. The tool returns the role text (`commands/manager-role.md`, with the bridge and project paths filled in), which takes effect at once;
+- or from a shell: `python3 systemd/manager_mode.py on --project <path>`.
+
+While the mode is on, the hooks:
+
+- **PreToolUse** — block `Edit`, `Write`, `MultiEdit`, `NotebookEdit` and obvious Bash writes (`>`, `>>`, `tee`, `sed -i`, `perl -i`, `patch`, `git apply/am`) inside the project, with a reason that tells the model to delegate. Allowed inside the project: `.agent-tasks/` (long task specs) and `.git/info/exclude`; outside the project root nothing is blocked;
+- **UserPromptSubmit** — add a short role reminder to every user turn, so the role does not fade in a long session;
+- **SessionStart** — add the full role text after startup, `/clear` and compaction.
+
+Turning it off is for a human only: `python3 systemd/manager_mode.py off --project <path>` (the MCP tool has no `off`, or the model could lift its own guard). `status`, `list` and `role` are read-only.
+
+Workers are never blocked: the headless launchers export `AGENT_BRIDGE_WORKER=1`, and interactive OpenClaude shifts run with `CLAUDE_CODE_USE_OPENAI=1`. Notes:
+
+- the mode applies to every Claude Code session in that project, not to one session;
+- a session started before `install` gets the role text but no enforcement; in it use `/permissions` → Deny `Edit`, `Write`, `NotebookEdit`;
+- the new `manager` tool and prompt appear after the MCP server is reconnected (`/mcp` → `agent_bridge` → Reconnect), without restarting Claude Code;
+- the guard is a safety net, not a sandbox: a write through, say, `python3 -c` is not recognised, and anything the hook cannot parse is let through. The role does the main work.
 
 ## Automatic delivery and progress
 
@@ -440,7 +475,7 @@ uv run python systemd/test_dispatcher.py
 
 `test_bridge.py` is a destructive end-to-end test that deletes and recreates `bridge.db`. Run it only in a disposable copy of the project before live traffic, never against a database containing real messages.
 
-Current safe suite: 69 dispatcher tests, including a deterministic stress test for concurrent supervisors against a non-WAL database held by a writer.
+Current safe suite: 73 dispatcher tests, including a deterministic stress test for concurrent supervisors against a non-WAL database held by a writer.
 
 `systemd/schema.py` is the shared core of the dispatcher: DDL, the connection recipe, the `config.json` reader and the single definition of the dispatch set used by both the listener and `--recover`. Change dispatch rules there, not in the callers.
 
