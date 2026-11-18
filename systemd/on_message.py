@@ -68,11 +68,13 @@ ROOT = HERE.parent                            # agent_bridge
 WORKSPACE = Path(os.path.expanduser(
     os.environ.get("AGENT_BRIDGE_WORKSPACE") or str(ROOT.parent))).resolve()
 
-AGENT_PREFIX = {"claude": "cclocal", "kimi": "kimi", "local": "oclocal"}
+AGENT_PREFIX = {"claude": "cclocal", "kimi": "kimi", "local": "oclocal",
+                "opencode": "opencode"}
 WORKER_LABEL = {
     "claude": "cclocal (Claude Code, официальный клиент от Anthropic)",
     "kimi": "kimi (Kimi CLI, официальный клиент от Moonshot AI)",
     "local": "oclocal (OpenClaude, открытый клиент; локальная модель llama-server)",
+    "opencode": "opencode (OpenCode 2, открытый клиент; модель задаёт OPENCODE_WORKER_MODEL)",
 }
 PERMISSION_NOTE = {
     "claude": (
@@ -92,6 +94,13 @@ PERMISSION_NOTE = {
         "(openclaude --print) с --permission-mode default, любое действие\n"
         "вне allowlist настроек проекта отклоняется автоматически — при\n"
         "таком отказе оформляй blocked."
+    ),
+    "opencode": (
+        "У тебя нет интерактивного подтверждения: клиент запущен headless\n"
+        "(opencode run без --auto), любой запрос разрешения отклоняется\n"
+        "автоматически по правилам systemd/opencode-permissions.json — при\n"
+        "таком отказе оформляй blocked. Инструменты моста у тебя называются\n"
+        "agent_bridge_<имя>, например agent_bridge_claim_message."
     ),
 }
 
@@ -139,6 +148,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--local-launcher", default=str(HERE / "oclocal_headless.sh"))
     p.add_argument("--local-mcp-config", default=str(HERE / "mcp.local.json"),
                    help="local worker: --strict-mcp-config source (AGENT_ID=local)")
+    p.add_argument("--opencode-launcher",
+                   default=str(HERE / "opencode_headless.sh"),
+                   help="opencode worker launcher (builds its own MCP config"
+                        " with AGENT_ID=opencode)")
     p.add_argument("--workspace", default=str(WORKSPACE),
                    help="worker cwd; project MCP configs live here")
     p.add_argument("--mcp-config", default=str(WORKSPACE / ".mcp.json"),
@@ -580,6 +593,16 @@ def _worker_command(args: argparse.Namespace, con: sqlite3.Connection,
             "--strict-mcp-config",
         ]
         return argv, prompt.encode("utf-8"), {}
+    if recipient == "opencode":
+        # OpenCode 2 headless: `opencode run` reads the whole message from
+        # stdin when no message argument is given, so the payload never
+        # reaches argv. The launcher injects the bridge MCP server
+        # (AGENT_ID=opencode) and the permission rules through
+        # OPENCODE_CONFIG_CONTENT. OpenCode names MCP tools
+        # <server>_<tool>, so the protocol uses those names directly — a
+        # weaker local model should not have to translate them.
+        prompt = prompt.replace("mcp__agent_bridge__", "agent_bridge_")
+        return [args.opencode_launcher], prompt.encode("utf-8"), {}
     # kimi: request file keeps the task text out of argv entirely.
     request_path = runtime_dir / f"request_{message_id}.txt"
     fd = os.open(request_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)

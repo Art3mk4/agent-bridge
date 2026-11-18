@@ -138,7 +138,7 @@ MCP-промпт `manager` (в Claude Code — `/mcp__agent_bridge__manager`, а
 ## 2. CLI `systemd/listener.py`
 
 ```text
-listener.py run|status|progress|watch|pending|wait|enable|disable --agent kimi|claude|local
+listener.py run|status|progress|watch|pending|wait|enable|disable --agent kimi|claude|local|opencode
     [--db bridge.db] [--config systemd/config.json] [--runtime-dir systemd/runtime]
     [--on-message systemd/on_message.py] [--once]
     [--conversation N ...] [--message N ...] [--timeout 3600]      # wait
@@ -172,9 +172,12 @@ on_message.py [message_id] [--recover] [--auto]
     [--db ...] [--config ...] [--runtime-dir ...]
     [--prompt-template systemd/dispatcher_prompt.md]
     [--claude-launcher cclocal_headless.sh] [--kimi-launcher kimi_headless.sh]
+    [--local-launcher oclocal_headless.sh] [--opencode-launcher opencode_headless.sh]
     [--workspace <vibe_coding>] [--mcp-config <workspace>/.mcp.json]
     [--worker-timeout 3300]
 ```
+
+Префиксы ключей отчёта по получателю: `claude` → `cclocal`, `kimi` → `kimi`, `local` → `oclocal`, `opencode` → `opencode`. Для `opencode` имена инструментов моста в протоколе переписываются в формат OpenCode (`agent_bridge_<tool>`), задача уходит через stdin.
 
 Единственный lifecycle-исполнитель сообщения: валидация → вставка строки `dispatch_attempts` (PK `message_id` — барьер «ровно одна попытка», авто-retry никогда) → сборка prompt'а из шаблона → выбор лаунчера по `recipient` → запуск воркера (отдельный process group) → классификация исхода **по evidence** (подтверждённый оригинал + результат по ключу `<prefix>:<id>:result`; саморепорт `<prefix>:<id>:blocked` принимается как честный blocked), а не по exit-коду → при неудаче короткий notice без payload инициатору. Жёсткий сбой (failed/timeout/interrupted/uncertain) замораживает активный диалог в `blocked`. Таймаут воркера 3300 с (под 60-минутным claim lease).
 

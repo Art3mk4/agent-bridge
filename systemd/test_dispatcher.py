@@ -151,7 +151,8 @@ if mode == "script":
 db = os.environ.get("FAKE_DB", "")
 runs = os.environ.get("FAKE_RUNS")
 agent = os.environ.get("FAKE_AGENT", "claude")
-prefix = {"claude": "cclocal", "kimi": "kimi"}.get(agent, "cclocal")
+prefix = {"claude": "cclocal", "kimi": "kimi", "local": "oclocal",
+          "opencode": "opencode"}.get(agent, "cclocal")
 argv_blob = " ".join(sys.argv[1:])
 try:
     data = sys.stdin.read()
@@ -526,7 +527,8 @@ def sup_run(d: Path, db: Path, cfg: Path, *flags: str, mode: str = "success",
             agent: str = "claude", child: Path | None = None,
             argv_out: Path | None = None, wtimeout: str = "2",
             extra_env: dict | None = None,
-            claude_launcher: Path | None = None) -> subprocess.CompletedProcess:
+            claude_launcher: Path | None = None,
+            opencode_launcher: Path | None = None) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env.update({
         "FAKE_PY": PY,
@@ -548,6 +550,7 @@ def sup_run(d: Path, db: Path, cfg: Path, *flags: str, mode: str = "success",
            "--prompt-template", str(PROMPT),
            "--claude-launcher", str(claude_launcher or FAKE_CLAUDE_LAUNCHER),
            "--kimi-launcher", str(FAKE_KIMI_LAUNCHER),
+           "--opencode-launcher", str(opencode_launcher or FAKE_CLAUDE_LAUNCHER),
            "--worker-timeout", wtimeout]
     return subprocess.run(cmd, capture_output=True, text=True, timeout=60,
                           env=env)
@@ -2723,7 +2726,8 @@ def test_61_config_reader_and_workspace(d: Path):
     sm = _load_schema_mod()
     cfg, err = sm.load_dispatch_config(d / "absent.json")
     check("missing -> defaults", cfg["auto"] == {"claude": True, "kimi": False,
-                                                 "local": True}
+                                                 "local": True,
+                                                 "opencode": False}
           and cfg["max_age_seconds"] == 86400.0 and err is None, str(cfg))
     bad = d / "bad.json"
     bad.write_text("{not json", encoding="utf-8")
@@ -2741,7 +2745,8 @@ def test_61_config_reader_and_workspace(d: Path):
     ok = write_cfg(new_area("t61ok"), kimi=True, max_age=90)
     cfg, err = sm.load_dispatch_config(ok)
     check("valid config read", cfg["auto"] == {"claude": True, "kimi": True,
-                                               "local": False}
+                                               "local": False,
+                                               "opencode": False}
           and cfg["max_age_seconds"] == 90.0 and err is None, str(cfg))
     # AGENT_BRIDGE_WORKSPACE moves the worker cwd for clones that do not
     # live inside the project directory.
@@ -3517,6 +3522,158 @@ def test_79_launchers_mark_workers(d: Path):
           in (HERE / "kimi_headless.sh").read_text(encoding="utf-8"))
 
 
+# ------------------------------------------------------------------ opencode
+
+OPENCODE_LAUNCHER = HERE / "opencode_headless.sh"
+
+
+def _fake_opencode(d: Path) -> Path:
+    fake = d / "fake_opencode.sh"
+    fake.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$@" > "$OC_ARGV"\n'
+        'printf "%s" "$OPENCODE_CONFIG_CONTENT" > "$OC_CFG"\n'
+        'cat > "$OC_STDIN"\n'
+        'echo "worker=$AGENT_BRIDGE_WORKER key=$OPENCODE_LOCAL_API_KEY"\n',
+        encoding="utf-8")
+    fake.chmod(0o755)
+    return fake
+
+
+def _run_oc(d: Path, stdin: str, **extra: str) -> subprocess.CompletedProcess:
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("OPENCODE_", "LOCAL_CLAUDE_", "LOCAL_API_"))
+           and k != "AGENT_BRIDGE_WORKER"}
+    env.update(OC_ARGV=str(d / "argv"), OC_CFG=str(d / "cfg.json"),
+               OC_STDIN=str(d / "stdin"))
+    env.update(extra)
+    return subprocess.run(["bash", str(OPENCODE_LAUNCHER)], input=stdin,
+                          capture_output=True, text=True, timeout=30, env=env)
+
+
+def test_80_opencode_launcher(d: Path):
+    # The OpenCode 2 worker: prompt through stdin only, a private server, no
+    # --auto (asks are rejected), the bridge MCP server with AGENT_ID=opencode
+    # and the permission rules injected as extra config, workers marked.
+    fake = _fake_opencode(d)
+    r = _run_oc(d, f"задача {SENTINEL}", OPENCODE_BIN=str(fake),
+                OPENCODE_WORKER_MODEL="zai-coding-plan/glm-5.3")
+    check("launcher rc0", r.returncode == 0, r.stderr[-300:])
+    argv = (d / "argv").read_text(encoding="utf-8").split("\n")
+    check("run on a private server, archived, json",
+          argv[:5] == ["run", "--standalone", "--archived", "--format",
+                       "json"], str(argv))
+    check("model passed", "--model" in argv
+          and argv[argv.index("--model") + 1] == "zai-coding-plan/glm-5.3")
+    check("never --auto", "--auto" not in argv
+          and "--dangerously-skip-permissions" not in argv, str(argv))
+    check("payload only on stdin", SENTINEL not in "\n".join(argv)
+          and SENTINEL in (d / "stdin").read_text(encoding="utf-8"))
+    check("worker marked", "worker=1" in r.stdout, r.stdout)
+    cfg = json.loads((d / "cfg.json").read_text(encoding="utf-8"))
+    srv = cfg["mcp"]["servers"]["agent_bridge"]
+    check("bridge MCP server, AGENT_ID=opencode, code mode off",
+          srv["type"] == "local" and srv["environment"] == {"AGENT_ID":
+                                                           "opencode"}
+          and srv["codemode"] is False
+          and srv["command"][-2:] == ["python", "server.py"]
+          and str(ROOT) in srv["command"], json.dumps(srv))
+    rules = cfg["permissions"]
+    check("default rules: ask first, bridge tools allowed, push denied",
+          rules[0] == {"action": "*", "resource": "*", "effect": "ask"}
+          and {"action": "agent_bridge_*", "resource": "*",
+               "effect": "allow"} in rules
+          and {"action": "shell", "resource": "git push*",
+               "effect": "deny"} in rules, str(rules[:3]))
+    check("no provider unless asked", "providers" not in cfg)
+    # Own rules file; a malformed one fails before opencode starts.
+    own = d / "perms.json"
+    own.write_text(json.dumps([{"action": "shell", "resource": "uv run *",
+                                "effect": "allow"}]), encoding="utf-8")
+    r = _run_oc(d, "x", OPENCODE_BIN=str(fake),
+                OPENCODE_WORKER_PERMISSIONS=str(own))
+    cfg = json.loads((d / "cfg.json").read_text(encoding="utf-8"))
+    check("custom rules file", r.returncode == 0 and cfg["permissions"] == [
+        {"action": "shell", "resource": "uv run *", "effect": "allow"}])
+    argv = (d / "argv").read_text(encoding="utf-8").split("\n")
+    check("no --model when unset", "--model" not in argv, str(argv))
+    own.write_text('{"edit": "allow"}', encoding="utf-8")
+    r = _run_oc(d, "x", OPENCODE_BIN=str(fake),
+                OPENCODE_WORKER_PERMISSIONS=str(own))
+    check("malformed rules refused", r.returncode != 0
+          and "permissions must be" in r.stderr, r.stderr[-200:])
+    r = _run_oc(d, "x", OPENCODE_BIN=str(d / "missing"))
+    check("missing opencode -> rc127", r.returncode == 127
+          and "OPENCODE_BIN" in r.stderr, r.stderr[-200:])
+
+
+def test_81_opencode_local_provider(d: Path):
+    # OPENCODE_WORKER_PROVIDER=local reuses the LOCAL_CLAUDE_* assignments
+    # of oclocal; the key goes through the environment, never into config.
+    fake = _fake_opencode(d)
+    envf = d / "aliases"
+    envf.write_text("LOCAL_CLAUDE_BASE_URL=http://10.0.0.5:8080/v1/\n"
+                    "LOCAL_CLAUDE_MODEL=qwen-test\n"
+                    "LOCAL_CLAUDE_AUTH_TOKEN=sekret-token\n", encoding="utf-8")
+    r = _run_oc(d, "x", OPENCODE_BIN=str(fake), OPENCODE_WORKER_PROVIDER="local",
+                OPENCODE_ENV_FILE=str(envf))
+    check("rc0", r.returncode == 0, r.stderr[-300:])
+    argv = (d / "argv").read_text(encoding="utf-8").split("\n")
+    check("model defaults to llama/<LOCAL_CLAUDE_MODEL>",
+          argv[argv.index("--model") + 1] == "llama/qwen-test", str(argv))
+    raw = (d / "cfg.json").read_text(encoding="utf-8")
+    prov = json.loads(raw)["providers"]["llama"]
+    check("openai-compatible provider on /v1",
+          prov["package"] == "aisdk:@ai-sdk/openai-compatible"
+          and prov["settings"]["baseURL"] == "http://10.0.0.5:8080/v1"
+          and "qwen-test" in prov["models"], json.dumps(prov))
+    check("key by reference only", "sekret-token" not in raw
+          and prov["settings"]["apiKey"] == "{env:OPENCODE_LOCAL_API_KEY}")
+    check("key in the child env", "key=sekret-token" in r.stdout)
+    envf.write_text("LOCAL_CLAUDE_MODEL=m\n", encoding="utf-8")
+    r = _run_oc(d, "x", OPENCODE_BIN=str(fake), OPENCODE_WORKER_PROVIDER="local",
+                OPENCODE_ENV_FILE=str(envf))
+    check("missing base url fails loudly", r.returncode != 0
+          and "LOCAL_CLAUDE_BASE_URL" in r.stderr, r.stderr[-200:])
+
+
+def test_82_opencode_dispatch(d: Path):
+    # End to end through the supervisor: the opencode branch gets the
+    # payload on stdin, its own dedup prefix, OpenCode's tool names in the
+    # protocol and its own permission note; the listener side knows the id.
+    db = new_db(d)
+    cfg = write_cfg(d)
+    doc = json.loads(cfg.read_text())
+    doc["auto"]["opencode"] = True
+    cfg.write_text(json.dumps(doc), encoding="utf-8")
+    dump = d / "prompt.txt"
+    mid = seed(db, sender="claude", recipient="opencode")
+    r = sup_run(d, db, cfg, mid, "--auto", mode="dump", agent="opencode",
+                extra_env={"FAKE_DUMP": str(dump)})
+    check("prompt captured", dump.exists(), r.stderr[-300:])
+    prompt = dump.read_text(encoding="utf-8")
+    check("OpenCode tool names in the protocol",
+          "agent_bridge_claim_message" in prompt
+          and "mcp__agent_bridge__" not in prompt, prompt[:400])
+    check("opencode dedup prefix", f"opencode:{mid}:result" in prompt)
+    check("opencode permission note", "opencode run без --auto" in prompt)
+    mid2 = seed(db, sender="claude", recipient="opencode")
+    r = sup_run(d, db, cfg, mid2, "--auto", mode="success", agent="opencode")
+    check("success rc0", r.returncode == 0, r.stderr[-300:])
+    check("worker ran via stdin as opencode",
+          f"RAN {mid2} via=stdin agent=opencode" in runs_of(d), str(runs_of(d)))
+    check("attempt succeeded", attempt_row(db, mid2)[0] == "succeeded",
+          str(attempt_row(db, mid2)))
+    rt = d / "runtime"
+    r = listener_cli("pending", "opencode", rt, db=db, cfg=cfg)
+    check("listener knows opencode", r.returncode == 0
+          and json.loads(r.stdout)["agent"] == "opencode", r.stderr[-200:])
+    off = write_cfg(new_area("t82off"))
+    check("opt-in by default", json.loads(listener_cli(
+        "pending", "opencode", rt, db=db, cfg=d / "absent.json").stdout)
+          ["auto"] is False and off.exists())
+
+
 def main() -> int:
     print(f"tmp: {TMP}")
     tests = [
@@ -3593,6 +3750,9 @@ def main() -> int:
         test_77_manager_install_merges_settings,
         test_78_manager_mcp_tool_and_prompt,
         test_79_launchers_mark_workers,
+        test_80_opencode_launcher,
+        test_81_opencode_local_provider,
+        test_82_opencode_dispatch,
     ]
     try:
         for fn in tests:

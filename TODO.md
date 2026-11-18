@@ -119,6 +119,13 @@
 - [x] `test_12` проверял статус отсоединённого слушателя один раз сразу после выхода MCP-сессии и падал примерно в половине прогонов под нагрузкой (на исходном коде тоже); теперь ждёт pid-файл через `wait_for`.
 - [x] `test_bridge.py` ожидал 5 MCP-инструментов (до диалогов и слушателя); обновлён до 8, сквозной прогон зелёный.
 
+## Поддержка OpenCode (2026-11-17)
+
+- [x] Четвёртый агент `opencode` (OpenCode 2): `systemd/opencode_headless.sh` (`opencode run --standalone --archived --format json`, задача через stdin, без `--auto`), правила `systemd/opencode-permissions.json`, MCP-сервер моста и при `OPENCODE_WORKER_PROVIDER=local` провайдер llama-server вводятся через `OPENCODE_CONFIG_CONTENT`; в протоколе — имена инструментов OpenCode (`agent_bridge_<tool>`); `auto.opencode` по умолчанию `false`. Флаги и формат конфига сверены с исходниками opencode 2.3.0 (`packages/cli/src/commands/commands.ts`, `run/run.ts`, `core/src/permission.ts`). Тесты `test_80`–`test_82`.
+- [x] Живая проверка на OpenCode 2.3.2 (npm `@opencode/cli`) со скриптовой OpenAI-совместимой моделью: супервизор → `opencode_headless.sh` → `opencode run` → MCP моста; модели предложены `agent_bridge_*`, отчёт `opencode:<id>:result`, попытка `succeeded`. Правила: `git push` → `Permission denied: shell`, `curl` (ask) → отклонён без человека, `git status` → выполнен. `opencode debug config` принимает конфиг без диагностик. Провайдер `local` проверен на этом же стенде.
+- [ ] Проверка с настоящей локальной моделью (llama-server) и реальной задачей с правкой файла.
+- [ ] Команда интерактивной смены для OpenCode (аналог `commands/oc-bridge-agent.md`).
+
 ## Режим Manager (2026-11-17)
 
 - [x] Главная модель в интерактивной сессии писала код сама вместо делегирования: промпт роли — обычное сообщение и со временем теряет вес. Сделан режим Manager (`systemd/manager_mode.py`, MCP-инструмент `manager`, промпт `/mcp__agent_bridge__manager`, роль `commands/manager-role.md`): хуки ставятся один раз (`install`), включение — без перезапуска, на проект; PreToolUse блокирует правки внутри проекта, UserPromptSubmit напоминает роль, SessionStart возвращает её после `/clear` и сжатия; выключение — только человеком. Воркеры помечены `AGENT_BRIDGE_WORKER=1`. Тесты `test_76`–`test_79`.
