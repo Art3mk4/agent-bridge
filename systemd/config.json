@@ -1,9 +1,10 @@
 {
-  "_comment": "Which recipients the per-agent listener may dispatch automatically (listener.py re-reads this on every scan; false = the listener idles). kimi is off by default: Kimi CLI -p applies its 'auto' permission policy without approval prompts (see kimi_headless.sh / README). dispatch_max_age_seconds: never-attempted messages older than this are not dispatched automatically (a human runs them; see `listener.py pending`); response_deadline is metadata and does not gate dispatch.",
+  "_comment": "Which recipients the per-agent listener may dispatch automatically (listener.py re-reads this on every scan; false = the listener idles). kimi is off by default: Kimi CLI -p applies its 'auto' permission policy without approval prompts (see kimi_headless.sh / README). opencode is off by default: choose OPENCODE_WORKER_MODEL and review systemd/opencode-permissions.json first (see opencode_headless.sh / README). dispatch_max_age_seconds: never-attempted messages older than this are not dispatched automatically (a human runs them; see `listener.py pending`); response_deadline is metadata and does not gate dispatch.",
   "auto": {
     "claude": true,
     "kimi": false,
-    "local": true
+    "local": true,
+    "opencode": false
   },
   "dispatch_max_age_seconds": 86400
 }

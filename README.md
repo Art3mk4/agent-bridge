@@ -152,6 +152,37 @@ openclaude --mcp-config /absolute/path/to/agent-bridge/systemd/mcp.local.json --
 
 An interactive OpenClaude session must never load the project `.mcp.json` used by the Claude Code worker — that file registers the same bridge as `claude`.
 
+### OpenCode
+
+Supported client: **OpenCode 2** (`opencode.ai/v2/install`); the 1.x config format (`mcp.<name>`, `permission`) is not used. The agent id is `opencode`.
+
+Headless workers need no registration: `systemd/opencode_headless.sh` injects the bridge itself (see [Worker launchers](#worker-launchers)). For an interactive OpenCode session, register the bridge globally with its own identity:
+
+```bash
+opencode mcp add agent_bridge --global --env AGENT_ID=opencode -- \
+  uv run --directory /absolute/path/to/agent-bridge python server.py
+```
+
+or in `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "agent_bridge": {
+        "type": "local",
+        "command": ["uv", "run", "--directory", "/absolute/path/to/agent-bridge", "python", "server.py"],
+        "environment": { "AGENT_ID": "opencode" },
+        "codemode": false
+      }
+    }
+  }
+}
+```
+
+OpenCode names MCP tools `<server>_<tool>`, so the bridge tools are `agent_bridge_send_message`, `agent_bridge_receive_messages` and so on; `"codemode": false` keeps them plain tool calls instead of Code Mode.
+
 ## Tools
 
 | Tool | Purpose |
@@ -415,6 +446,13 @@ The supervisor chooses a launcher by recipient:
 - `systemd/kimi_headless.sh` starts the official Kimi CLI in prompt mode and passes the task through a private request file so task text does not appear in argv or the process list.
 - `systemd/oclocal_headless.sh` starts a non-interactive OpenClaude worker (`openclaude --print`). It strips the inherited `ANTHROPIC_*` variables so the OpenAI-compatible endpoint of the local llama-server is the only provider the child can see, and exports `AGENT_BRIDGE_DIR` from its own location so `systemd/mcp.local.json` resolves from any clone layout. Like the Claude launcher it requires `LOCAL_CLAUDE_BASE_URL` and `LOCAL_CLAUDE_MODEL` (there is no built-in endpoint; a base URL ending in `/v1` is accepted as is), while `LOCAL_CLAUDE_AUTO_COMPACT` and `LOCAL_API_TIMEOUT_MS` stay optional. Permissions: `--permission-mode default` plus the project allowlist — there is no human to approve anything, so every action outside the allowlist is denied automatically.
 
+- `systemd/opencode_headless.sh` starts a non-interactive **OpenCode 2** worker: `opencode run --standalone --archived --format json`, with the task on stdin (OpenCode reads the whole message from stdin when no message argument is given, so it never reaches argv). Everything the worker needs goes in through `OPENCODE_CONFIG_CONTENT`, an extra config source on top of your own OpenCode config: the bridge MCP server (`mcp.servers.agent_bridge`, `AGENT_ID=opencode`, Code Mode off) and the permission rules from [`systemd/opencode-permissions.json`](systemd/opencode-permissions.json). `--standalone` gives the run a private server — OpenCode 2's background service keeps the environment it started with, so the injected config would not reliably apply through it. `run` is started **without `--auto`**: a request the rules leave at `ask` is rejected and the worker is told it cannot ask, so the honest outcome is a `blocked:` report. Settings:
+  - `OPENCODE_WORKER_MODEL` — `provider/model[#variant]`; empty means OpenCode's own default model;
+  - `OPENCODE_WORKER_PROVIDER=local` — use the local llama-server: the same `LOCAL_CLAUDE_*` assignments as `oclocal_headless.sh` become an OpenAI-compatible provider `llama` (model `llama/<LOCAL_CLAUDE_MODEL>` unless `OPENCODE_WORKER_MODEL` is set); the key travels in the environment and the config only refers to it as `{env:OPENCODE_LOCAL_API_KEY}`;
+  - `OPENCODE_WORKER_AGENT` — an OpenCode agent name; `OPENCODE_WORKER_PERMISSIONS` — your own rules file; `OPENCODE_BIN` — the executable.
+
+  Run `uv sync` in the bridge directory once before the first dispatch: the worker starts the bridge MCP server with `uv run`, and a first-time environment build can outlast OpenCode's MCP startup window, leaving the worker without the bridge tools. The listener and its supervisors inherit these variables from the MCP server that started the listener, so set them in the environment of that session (or export them before `listener.py enable --agent opencode`). `opencode` is opt-in: `auto.opencode` is `false` until you review the rules. The default rules ask (= reject) for everything, then allow reading, searching, editing inside the workspace, the bridge tools (`agent_bridge_*`) and read-only git/`ls`, and deny `git push`, `git reset --hard`, `rm -rf`, `sudo`, `.env` files, questions, subagents and web access. Rules are ordered and **the last matching rule wins**; add your project's test commands, e.g. `{"action": "shell", "resource": "uv run pytest*", "effect": "allow"}`.
+
 For public or team use, review these launchers and adapt them to your own client wrappers and permission model. Do not weaken static deny rules or hide permission requests.
 
 Workers run in the **workspace** directory — the project both CLIs open, where their project MCP configs live (`.mcp.json` for the Claude worker's `--strict-mcp-config`, `.kimi-code/mcp.json` for Kimi). By default it is the directory that *contains* this repository, which fits a layout like `~/project/agent-bridge`. If the clone lives elsewhere, set `AGENT_BRIDGE_WORKSPACE` in the `env` of both MCP registrations; the listener and its supervisors inherit it.
@@ -475,7 +513,7 @@ uv run python systemd/test_dispatcher.py
 
 `test_bridge.py` is a destructive end-to-end test that deletes and recreates `bridge.db`. Run it only in a disposable copy of the project before live traffic, never against a database containing real messages.
 
-Current safe suite: 73 dispatcher tests, including a deterministic stress test for concurrent supervisors against a non-WAL database held by a writer.
+Current safe suite: 76 dispatcher tests, including a deterministic stress test for concurrent supervisors against a non-WAL database held by a writer.
 
 `systemd/schema.py` is the shared core of the dispatcher: DDL, the connection recipe, the `config.json` reader and the single definition of the dispatch set used by both the listener and `--recover`. Change dispatch rules there, not in the callers.
 

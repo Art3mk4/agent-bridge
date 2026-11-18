@@ -47,8 +47,10 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-AGENTS = ("claude", "kimi", "local")
-DEFAULT_AUTO = {"claude": True, "kimi": False, "local": True}
+# opencode is opt-in like kimi: it needs a model chosen for the worker
+# (OPENCODE_WORKER_MODEL) and a reviewed permission set.
+AGENTS = ("claude", "kimi", "local", "opencode")
+DEFAULT_AUTO = {"claude": True, "kimi": False, "local": True, "opencode": False}
 DEFAULT_MAX_AGE_SECONDS = 86400.0
 BUSY_TIMEOUT_MS = 5000
 

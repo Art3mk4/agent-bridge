@@ -46,7 +46,7 @@ exit codes and pids. Logs go to runtime/dispatcher.log (same file as the
 supervisor's), rotated once at startup when over LOG_MAX_BYTES.
 
 CLI (emergency control without an MCP session):
-    listener.py run    --agent kimi|claude [--db --config --runtime-dir --on-message]
+    listener.py run    --agent kimi|claude|local|opencode [--db --config --runtime-dir --on-message]
     listener.py status --agent ... [--config --runtime-dir]
     listener.py enable --agent ... [--db --config --runtime-dir --on-message]
     listener.py disable --agent ... [--config --runtime-dir]
@@ -85,7 +85,7 @@ DEFAULT_CONFIG = HERE / "config.json"
 DEFAULT_RUNTIME = HERE / "runtime"
 DEFAULT_ON_MESSAGE = HERE / "on_message.py"
 
-AGENTS = {"kimi", "claude", "local"}
+AGENTS = {"kimi", "claude", "local", "opencode"}
 
 POLL_SECONDS = 1.0
 SLEEP_SLICE = 0.2
