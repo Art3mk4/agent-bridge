@@ -38,7 +38,7 @@ RUNTIME_DIR = SYSTEMD_DIR / "runtime"
 SCHEMA_PY = SYSTEMD_DIR / "schema.py"
 AGENTS = {"kimi", "claude", "local", "opencode"}
 WORKER_ID = str(uuid.uuid4())
-MAX_WAIT_SECONDS = 30.0
+MAX_WAIT_SECONDS = float(os.environ.get("AGENT_BRIDGE_MAX_WAIT", "300"))
 POLL_INTERVAL_SECONDS = 0.25
 MIN_TIMEOUT_SECONDS = 1.0
 MAX_TIMEOUT_SECONDS = 3600.0
@@ -992,7 +992,8 @@ def receive_messages(limit: int = 20, wait_seconds: float = 0) -> dict[str, Any]
     """Return available unread messages addressed to AGENT_ID, oldest first.
 
     Messages actively claimed by another server process are hidden. Waits up
-    to wait_seconds, capped at MAX_WAIT_SECONDS (30). Messages stay unread
+    to wait_seconds, capped at MAX_WAIT_SECONDS (default 300 s; override with
+    the AGENT_BRIDGE_MAX_WAIT env var). Messages stay unread
     until mark_read. Each message carries response_deadline, claim_expires_at
     and owned_by_current_worker; cursor is the last returned id, or None.
     """
